@@ -1,0 +1,24 @@
+[package]
+name = "serverkit"
+version = "0.1.0"
+edition = "2024"
+description = "A portable Rust HTTP application layer for Workers and native servers"
+readme = "README.md"
+
+[workspace]
+members = [".", "macros"]
+resolver = "3"
+
+[features]
+default = []
+json = ["dep:serde", "dep:serde_json"]
+
+[dependencies]
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+serverkit-macros = { version = "0.1.0", path = "macros" }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["net", "rt"] }
