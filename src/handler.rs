@@ -1,144 +1,177 @@
-use std::{future::Future, sync::Arc};
+use std::future::Future;
 
 use crate::{
-    IntoResponse, Request, RequestStream, Response,
-    extract::{Buffered, FromRequest, Input, Mode, Streaming, Unused},
+    FromRequest, IntoResponse, Request, Response,
+    openapi::Operation,
     stream::{BufferedRequestStream, collect_stream},
 };
 
-pub(crate) trait ResolveRequest<M: Mode, State>: FromRequest<M> {
-    type Next;
+pub trait Handler<Arguments, Input> {
+    async fn call(&self, request: Request) -> Response;
 
-    async fn resolve(
-        request: &Request,
-        buffered: &[u8],
-        state: State,
-    ) -> Result<(Self, Self::Next), Response>;
-}
-
-impl<A: FromRequest<Unused>, State> ResolveRequest<Unused, State> for A {
-    type Next = State;
-
-    async fn resolve(
-        request: &Request,
-        _buffered: &[u8],
-        state: State,
-    ) -> Result<(Self, Self::Next), Response> {
-        let value = <A as FromRequest<Unused>>::from_request(Input::<Unused>::new(request, ()))
-            .await
-            .map_err(IntoResponse::into_response)?;
-
-        Ok((value, state))
-    }
-}
-
-impl<A: FromRequest<Buffered>, State> ResolveRequest<Buffered, State> for A {
-    type Next = State;
-
-    async fn resolve(
-        request: &Request,
-        buffered: &[u8],
-        state: State,
-    ) -> Result<(Self, Self::Next), Response> {
-        let value =
-            <A as FromRequest<Buffered>>::from_request(Input::<Buffered>::new(request, buffered))
-                .await
-                .map_err(IntoResponse::into_response)?;
-
-        Ok((value, state))
-    }
-}
-
-impl<A: FromRequest<Streaming>> ResolveRequest<Streaming, Box<dyn RequestStream>> for A {
-    type Next = ();
-
-    async fn resolve(
-        request: &Request,
-        _buffered: &[u8],
-        stream: Box<dyn RequestStream>,
-    ) -> Result<(Self, Self::Next), Response> {
-        let value =
-            <A as FromRequest<Streaming>>::from_request(Input::<Streaming>::new(request, stream))
-                .await
-                .map_err(IntoResponse::into_response)?;
-
-        Ok((value, ()))
-    }
-}
-
-pub trait Handler<Arguments, Modes> {
-    async fn call(&self, request: Request, stream: Box<dyn RequestStream>) -> Response;
+    #[doc(hidden)]
+    fn openapi() -> Operation;
 }
 
 impl<Output: IntoResponse, Fut: Future<Output = Output>, F: Fn() -> Fut> Handler<(), ()> for F {
-    async fn call(&self, request: Request, stream: Box<dyn RequestStream>) -> Response {
+    async fn call(&self, request: Request) -> Response {
         drop(request);
-        drop(stream);
-
         self().await.into_response()
+    }
+
+    fn openapi() -> Operation {
+        let mut operation = Operation::default();
+        Output::openapi(&mut operation);
+        operation.ensure_response();
+        operation
     }
 }
 
 macro_rules! impl_handler {
-    (
-        $stream:ident,
-        $next:ident;
-        $(($argument:ident, $mode:ident, $value:ident, $state:ty, $input:ident)),+
-        $(,)?
-    ) => {
+    ([$(($argument:ident, $value:ident)),*]; ($last_argument:ident, $last_value:ident)) => {
         impl<
                 $(
-                    $mode: Mode,
-                    $argument: ResolveRequest<$mode, $state>,
-                )+
+                    $argument: for<'request> FromRequest<(
+                        &'request Request,
+                        &'request [u8],
+                    )>,
+                )*
+                $last_argument: for<'request> FromRequest<(
+                    &'request Request,
+                    &'request [u8],
+                )>,
                 Output: IntoResponse,
                 Fut: Future<Output = Output>,
-                F: Fn($($argument),+) -> Fut,
-            > Handler<($($argument,)+), ($($mode,)+)> for F
+                F: Fn($($argument,)* $last_argument) -> Fut,
+            > Handler<($($argument,)* $last_argument,), ()> for F
         {
-            async fn call(
-                &self,
-                request: Request,
-                mut $stream: Box<dyn RequestStream>,
-            ) -> Response {
+            async fn call(&self, mut request: Request) -> Response {
                 let has_buffered = false
-                    $(|| <$argument as FromRequest<$mode>>::BUFFERED)+;
+                    $(|| <$argument as FromRequest<(&Request, &[u8])>>::BUFFERED)*
+                    || <$last_argument as FromRequest<(&Request, &[u8])>>::BUFFERED;
 
                 let buffered = if has_buffered {
-                    let bytes = match collect_stream($stream.as_mut()).await {
-                        Ok(bytes) => bytes,
-                        Err(error) => return error.into_response(),
-                    };
+                    let body_limit = request.body_limit();
 
-                    Arc::new(bytes)
+                    match collect_stream(request.body.as_mut(), body_limit).await {
+                        Ok(buffered) => buffered,
+                        Err(error) => return error.into_response(),
+                    }
                 } else {
-                    Arc::new(Vec::new())
+                    Vec::new()
                 };
 
-                if has_buffered {
-                    $stream = Box::new(BufferedRequestStream::new(Arc::clone(&buffered)));
-                }
-
                 $(
-                    let ($value, $next) = match <$argument as ResolveRequest<
-                        $mode,
-                        $state,
-                    >>::resolve(
-                        &request,
-                        buffered.as_slice(),
-                        $input,
-                    )
+                    let $value = match <$argument as FromRequest<(
+                        &Request,
+                        &[u8],
+                    )>>::from_request((&request, buffered.as_slice()))
                     .await
                     {
                         Ok(value) => value,
-                        Err(response) => return response,
+                        Err(error) => return error.into_response(),
                     };
-                )+
+                )*
 
-                drop($next);
-                drop(buffered);
+                let $last_value = match <$last_argument as FromRequest<(
+                    &Request,
+                    &[u8],
+                )>>::from_request((&request, buffered.as_slice()))
+                .await
+                {
+                    Ok(value) => value,
+                    Err(error) => return error.into_response(),
+                };
 
-                self($($value),+).await.into_response()
+                self($($value,)* $last_value).await.into_response()
+            }
+
+            fn openapi() -> Operation {
+                let mut operation = Operation::default();
+                $(
+                    <$argument as FromRequest<(
+                        &Request,
+                        &[u8],
+                    )>>::openapi(&mut operation);
+                )*
+                <$last_argument as FromRequest<(
+                    &Request,
+                    &[u8],
+                )>>::openapi(&mut operation);
+                Output::openapi(&mut operation);
+                operation.ensure_response();
+                operation
+            }
+        }
+
+        impl<
+                $(
+                    $argument: for<'request> FromRequest<(
+                        &'request Request,
+                        &'request [u8],
+                    )>,
+                )*
+                $last_argument: FromRequest<Request>,
+                Output: IntoResponse,
+                Fut: Future<Output = Output>,
+                F: Fn($($argument,)* $last_argument) -> Fut,
+            > Handler<($($argument,)* $last_argument,), Request> for F
+        {
+            async fn call(&self, mut request: Request) -> Response {
+                let has_buffered = false
+                    $(|| <$argument as FromRequest<(&Request, &[u8])>>::BUFFERED)*;
+
+                let buffered = if has_buffered {
+                    let body_limit = request.body_limit();
+
+                    match collect_stream(request.body.as_mut(), body_limit).await {
+                        Ok(buffered) => buffered,
+                        Err(error) => return error.into_response(),
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                $(
+                    let $value = match <$argument as FromRequest<(
+                        &Request,
+                        &[u8],
+                    )>>::from_request((&request, buffered.as_slice()))
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => return error.into_response(),
+                    };
+                )*
+
+                if has_buffered {
+                    request.body = Box::new(BufferedRequestStream::new(buffered));
+                }
+
+                let $last_value = match <$last_argument as FromRequest<Request>>::from_request(
+                    request,
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(error) => return error.into_response(),
+                };
+
+                self($($value,)* $last_value).await.into_response()
+            }
+
+            fn openapi() -> Operation {
+                let mut operation = Operation::default();
+                $(
+                    <$argument as FromRequest<(
+                        &Request,
+                        &[u8],
+                    )>>::openapi(&mut operation);
+                )*
+                <$last_argument as FromRequest<Request>>::openapi(&mut operation);
+                Output::openapi(&mut operation);
+                operation.ensure_response();
+                operation
             }
         }
     };
@@ -148,11 +181,114 @@ serverkit_macros::impl_handlers!(12);
 
 #[cfg(test)]
 mod tests {
-    use crate::{Handler, Method, Unused};
+    use std::{
+        cell::Cell,
+        convert::Infallible,
+        future::Future,
+        rc::Rc,
+        task::{Context, Poll, Waker},
+    };
+
+    use crate::{
+        App, Body, Bytes, Extension, FromRequest, Handler, Headers, Method, Request, RequestStream,
+        RouteMethods, State, StreamError,
+    };
+
+    struct ProbeStream {
+        body: Option<Vec<u8>>,
+        polls: Rc<Cell<usize>>,
+    }
+
+    impl RequestStream for ProbeStream {
+        fn poll_next(
+            &mut self,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Vec<u8>, StreamError>>> {
+            self.polls.set(self.polls.get() + 1);
+            Poll::Ready(self.body.take().map(Ok))
+        }
+    }
+
+    struct BufferedBytes(Vec<u8>);
+
+    impl<'request> FromRequest<(&'request Request, &'request [u8])> for BufferedBytes {
+        type Error = Infallible;
+
+        const BUFFERED: bool = true;
+
+        async fn from_request(
+            input: (&'request Request, &'request [u8]),
+        ) -> Result<Self, Self::Error> {
+            Ok(Self(input.1.to_vec()))
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    fn request(body: &[u8], polls: Rc<Cell<usize>>) -> Request {
+        Request::new(
+            Method::new("GET"),
+            "/",
+            None,
+            Headers::new(),
+            Box::new(ProbeStream {
+                body: Some(body.to_vec()),
+                polls,
+            }),
+        )
+    }
 
     async fn one(_a0: Method) {}
 
     async fn two(_a0: Method, _a1: Method) {}
+
+    async fn stream_last(_a0: Method, _a1: Body) {}
+
+    async fn leave_stream_unread(_body: Body) -> &'static str {
+        "unread"
+    }
+
+    async fn buffered_then_stream(
+        first: BufferedBytes,
+        second: BufferedBytes,
+        mut body: Body,
+    ) -> Vec<u8> {
+        assert_eq!(first.0, second.0);
+        body.next().await.unwrap().unwrap()
+    }
+
+    async fn buffered_body(Bytes(bytes): Bytes) -> Vec<u8> {
+        bytes
+    }
+
+    async fn streaming_body(mut body: Body) -> Result<Vec<u8>, StreamError> {
+        let mut bytes = Vec::new();
+
+        while let Some(chunk) = body.next().await {
+            bytes.extend(chunk?);
+        }
+
+        Ok(bytes)
+    }
+
+    async fn application_state(State(value): State<String>) -> String {
+        value.as_str().to_owned()
+    }
+
+    async fn request_extension(Extension(value): Extension<u64>) -> String {
+        value.to_string()
+    }
 
     #[allow(clippy::too_many_arguments)]
     async fn twelve(
@@ -171,12 +307,13 @@ mod tests {
     ) {
     }
 
-    fn assert_handler<Arguments, Modes, H: Handler<Arguments, Modes>>(_handler: H) {}
+    fn assert_handler<Arguments, Input, H: Handler<Arguments, Input>>(_handler: H) {}
 
     #[test]
     fn implements_supported_arities() {
-        assert_handler::<(Method,), (Unused,), _>(one);
-        assert_handler::<(Method, Method), (Unused, Unused), _>(two);
+        assert_handler::<(Method,), (), _>(one);
+        assert_handler::<(Method, Method), (), _>(two);
+        assert_handler::<(Method, Body), Request, _>(stream_last);
         assert_handler::<
             (
                 Method,
@@ -192,21 +329,52 @@ mod tests {
                 Method,
                 Method,
             ),
-            (
-                Unused,
-                Unused,
-                Unused,
-                Unused,
-                Unused,
-                Unused,
-                Unused,
-                Unused,
-                Unused,
-                Unused,
-                Unused,
-                Unused,
-            ),
+            (),
             _,
         >(twelve);
+    }
+
+    #[test]
+    fn streaming_only_does_not_preconsume_the_body() {
+        let polls = Rc::new(Cell::new(0));
+        let application = App::new(("/".GET(leave_stream_unread),));
+        let response = block_on(application.handle(request(b"stream", Rc::clone(&polls))));
+
+        assert_eq!(response.body(), b"unread");
+        assert_eq!(polls.get(), 0);
+    }
+
+    #[test]
+    fn buffered_extractors_share_one_collection_before_streaming() {
+        let polls = Rc::new(Cell::new(0));
+        let application = App::new(("/".GET(buffered_then_stream),));
+        let response = block_on(application.handle(request(b"replayed", Rc::clone(&polls))));
+
+        assert_eq!(response.body(), b"replayed");
+        assert_eq!(polls.get(), 2);
+    }
+
+    #[test]
+    fn body_limit_applies_to_buffered_and_streaming_extractors() {
+        let buffered = App::new(("/".GET(buffered_body),)).body_limit(3);
+        let response = block_on(buffered.handle(request(b"four", Rc::new(Cell::new(0)))));
+        assert_eq!(response.status(), 413);
+
+        let streaming = App::new(("/".GET(streaming_body),)).body_limit(3);
+        let response = block_on(streaming.handle(request(b"four", Rc::new(Cell::new(0)))));
+        assert_eq!(response.status(), 413);
+    }
+
+    #[test]
+    fn extracts_application_state_and_request_extensions() {
+        let application = App::new(("/".GET(application_state),)).state("ready".to_owned());
+        let response = block_on(application.handle(request(b"", Rc::new(Cell::new(0)))));
+        assert_eq!(response.body(), b"ready");
+
+        let application = App::new(("/".GET(request_extension),));
+        let mut request = request(b"", Rc::new(Cell::new(0)));
+        request.insert_extension(42_u64);
+        let response = block_on(application.handle(request));
+        assert_eq!(response.body(), b"42");
     }
 }

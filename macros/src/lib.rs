@@ -56,29 +56,20 @@ fn parse_maximum(input: TokenStream) -> Result<usize, String> {
 }
 
 fn handler_invocation(arity: usize) -> Result<String, String> {
-    let mut invocation = String::from("impl_handler!(stream,state;");
+    let mut invocation = String::from("impl_handler!([");
 
-    for index in 0..arity {
-        let state = state_type(index);
-        let input = if index == 0 { "stream" } else { "state" };
+    for index in 0..arity.saturating_sub(1) {
+        if index > 0 {
+            invocation.push(',');
+        }
 
-        write!(invocation, "(A{index},M{index},a{index},{state},{input}),")
-            .map_err(|error| error.to_string())?;
+        write!(invocation, "(A{index},a{index})").map_err(|error| error.to_string())?;
     }
 
-    invocation.push_str(");");
+    let last = arity - 1;
+    write!(invocation, "];(A{last},a{last}));").map_err(|error| error.to_string())?;
 
     Ok(invocation)
-}
-
-fn state_type(index: usize) -> String {
-    let mut state = String::from("Box<dyn RequestStream>");
-
-    for previous in 0..index {
-        state = format!("<A{previous} as ResolveRequest<M{previous},{state}>>::Next");
-    }
-
-    state
 }
 
 fn compile_error(message: &str) -> TokenStream {

@@ -1,11 +1,18 @@
-use crate::{RequestStream, StreamError};
+use crate::{RequestStream, StreamError, stream::LimitedRequestStream};
 
 pub struct Body {
     stream: Box<dyn RequestStream>,
 }
 
 impl Body {
-    pub(crate) fn new(stream: Box<dyn RequestStream>) -> Self {
+    pub(crate) fn new(stream: Box<dyn RequestStream>, limit: Option<usize>) -> Self {
+        let stream = match limit {
+            Some(limit) => {
+                Box::new(LimitedRequestStream::new(stream, limit)) as Box<dyn RequestStream>
+            }
+            None => stream,
+        };
+
         Self { stream }
     }
 

@@ -20,12 +20,20 @@ pub trait Values {
     fn name_matches(&self, actual: &str, expected: &str) -> bool {
         actual == expected
     }
+
+    fn names_are_case_insensitive(&self) -> bool {
+        false
+    }
+
+    fn strip_name_prefix<'name>(&self, actual: &'name str, prefix: &str) -> Option<&'name str> {
+        actual.strip_prefix(prefix)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnknownFields {
     Reject,
-    Allow,
+    Ignore,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,16 +42,16 @@ pub struct DecodeOptions {
 }
 
 impl DecodeOptions {
-    pub const fn reject_unknown() -> Self {
-        Self {
-            unknown_fields: UnknownFields::Reject,
-        }
+    pub const fn new(unknown_fields: UnknownFields) -> Self {
+        Self { unknown_fields }
     }
 
-    pub const fn allow_unknown() -> Self {
-        Self {
-            unknown_fields: UnknownFields::Allow,
-        }
+    pub const fn reject_unknown() -> Self {
+        Self::new(UnknownFields::Reject)
+    }
+
+    pub const fn ignore_unknown() -> Self {
+        Self::new(UnknownFields::Ignore)
     }
 
     pub const fn unknown_fields(self) -> UnknownFields {
@@ -58,7 +66,174 @@ impl Default for DecodeOptions {
 }
 
 pub trait Schema: Sized {
+    const UNKNOWN_FIELDS: Option<UnknownFields> = None;
+
     fn decode<V: Values>(values: &V, options: DecodeOptions) -> Result<Self, ValidationErrors>;
+
+    fn metadata() -> SchemaMetadata;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaMetadata {
+    name: Option<String>,
+    kind: SchemaKind,
+}
+
+impl SchemaMetadata {
+    pub fn new(kind: SchemaKind) -> Self {
+        Self { name: None, kind }
+    }
+
+    pub fn named(name: impl Into<String>, kind: SchemaKind) -> Self {
+        Self {
+            name: Some(name.into()),
+            kind,
+        }
+    }
+
+    pub fn array(items: Self) -> Self {
+        Self::new(SchemaKind::Array(Box::new(items)))
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn kind(&self) -> &SchemaKind {
+        &self.kind
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SchemaKind {
+    String,
+    Integer,
+    Number,
+    Boolean,
+    Bytes,
+    Object(Vec<SchemaField>),
+    Enum(Vec<String>),
+    Array(Box<SchemaMetadata>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaField {
+    name: String,
+    schema: SchemaMetadata,
+    required: bool,
+    minimum: Option<String>,
+    maximum: Option<String>,
+    minimum_length: Option<usize>,
+    maximum_length: Option<usize>,
+}
+
+impl SchemaField {
+    pub fn new(name: impl Into<String>, schema: SchemaMetadata, required: bool) -> Self {
+        Self {
+            name: name.into(),
+            schema,
+            required,
+            minimum: None,
+            maximum: None,
+            minimum_length: None,
+            maximum_length: None,
+        }
+    }
+
+    pub fn minimum(mut self, minimum: impl ToString) -> Self {
+        self.minimum = Some(minimum.to_string());
+        self
+    }
+
+    pub fn maximum(mut self, maximum: impl ToString) -> Self {
+        self.maximum = Some(maximum.to_string());
+        self
+    }
+
+    pub fn minimum_length(mut self, minimum: usize) -> Self {
+        self.minimum_length = Some(minimum);
+        self
+    }
+
+    pub fn maximum_length(mut self, maximum: usize) -> Self {
+        self.maximum_length = Some(maximum);
+        self
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn schema(&self) -> &SchemaMetadata {
+        &self.schema
+    }
+
+    pub fn required(&self) -> bool {
+        self.required
+    }
+
+    pub fn minimum_value(&self) -> Option<&str> {
+        self.minimum.as_deref()
+    }
+
+    pub fn maximum_value(&self) -> Option<&str> {
+        self.maximum.as_deref()
+    }
+
+    pub fn minimum_length_value(&self) -> Option<usize> {
+        self.minimum_length
+    }
+
+    pub fn maximum_length_value(&self) -> Option<usize> {
+        self.maximum_length
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExtraFields {
+    entries: Vec<(String, Vec<u8>)>,
+    case_insensitive: bool,
+}
+
+impl ExtraFields {
+    pub fn get(&self, name: &str) -> Option<&[u8]> {
+        self.entries
+            .iter()
+            .find(|(actual, _)| self.name_matches(actual, name))
+            .map(|(_, value)| value.as_slice())
+    }
+
+    pub fn get_all<'fields>(
+        &'fields self,
+        name: &'fields str,
+    ) -> impl Iterator<Item = &'fields [u8]> + 'fields {
+        self.entries
+            .iter()
+            .filter(move |(actual, _)| self.name_matches(actual, name))
+            .map(|(_, value)| value.as_slice())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.entries
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_slice()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn name_matches(&self, actual: &str, expected: &str) -> bool {
+        if self.case_insensitive {
+            actual.eq_ignore_ascii_case(expected)
+        } else {
+            actual == expected
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +298,15 @@ impl ValidationIssue {
 
         self
     }
+
+    #[doc(hidden)]
+    pub fn prefix_field(mut self, prefix: &str) -> Self {
+        self.field = Some(match self.field {
+            Some(field) => format!("{prefix}.{field}"),
+            None => prefix.to_owned(),
+        });
+        self
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -156,6 +340,15 @@ impl ValidationErrors {
     pub(crate) fn push(&mut self, issue: ValidationIssue) {
         self.issues.push(issue);
     }
+
+    fn extend_nested(&mut self, prefix: &str, errors: Self) {
+        self.issues.extend(
+            errors
+                .issues
+                .into_iter()
+                .map(|issue| issue.prefix_field(prefix)),
+        );
+    }
 }
 
 impl fmt::Display for ValidationErrors {
@@ -182,9 +375,12 @@ impl IntoResponse for ValidationErrors {
     }
 }
 
-#[doc(hidden)]
 pub trait ValueSchema: Sized {
     fn decode_value(bytes: &[u8]) -> Result<Self, String>;
+
+    fn metadata() -> SchemaMetadata {
+        SchemaMetadata::new(SchemaKind::String)
+    }
 }
 
 impl ValueSchema for String {
@@ -197,10 +393,14 @@ impl ValueSchema for Vec<u8> {
     fn decode_value(bytes: &[u8]) -> Result<Self, String> {
         Ok(bytes.to_vec())
     }
+
+    fn metadata() -> SchemaMetadata {
+        SchemaMetadata::new(SchemaKind::Bytes)
+    }
 }
 
 macro_rules! value_schema {
-    ($($type:ty),+ $(,)?) => {
+    ($kind:ident: $($type:ty),+ $(,)?) => {
         $(
             impl ValueSchema for $type {
                 fn decode_value(bytes: &[u8]) -> Result<Self, String> {
@@ -211,14 +411,18 @@ macro_rules! value_schema {
                         .parse::<Self>()
                         .map_err(|_| format!("must be a valid {}", stringify!($type)))
                 }
+
+                fn metadata() -> SchemaMetadata {
+                    SchemaMetadata::new(SchemaKind::$kind)
+                }
             }
         )+
     };
 }
 
-value_schema!(
-    bool, u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64,
-);
+value_schema!(Boolean: bool);
+value_schema!(Integer: u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
+value_schema!(Number: f32, f64);
 
 impl<T: ValueSchema> Schema for T {
     fn decode<V: Values>(values: &V, options: DecodeOptions) -> Result<Self, ValidationErrors> {
@@ -230,6 +434,10 @@ impl<T: ValueSchema> Schema for T {
             Some(value) if errors.is_empty() => Ok(value),
             _ => Err(errors),
         }
+    }
+
+    fn metadata() -> SchemaMetadata {
+        T::metadata()
     }
 }
 
@@ -341,6 +549,41 @@ impl<'values, V: Values> Decoder<'values, V> {
         }
     }
 
+    pub fn required_nested<T: Schema>(&mut self, name: &str) -> Option<T> {
+        let options = nested_options::<T>(self.options);
+        let values = self.nested_values(name);
+
+        if values.is_empty() {
+            self.issue(Some(name), ValidationRule::Missing, "is required");
+            return None;
+        }
+
+        match T::decode(&values, options) {
+            Ok(value) => Some(value),
+            Err(errors) => {
+                self.errors.extend_nested(name, errors);
+                None
+            }
+        }
+    }
+
+    pub fn optional_nested<T: Schema>(&mut self, name: &str) -> Option<Option<T>> {
+        let options = nested_options::<T>(self.options);
+        let values = self.nested_values(name);
+
+        if values.is_empty() {
+            return Some(None);
+        }
+
+        match T::decode(&values, options) {
+            Ok(value) => Some(Some(value)),
+            Err(errors) => {
+                self.errors.extend_nested(name, errors);
+                None
+            }
+        }
+    }
+
     pub fn minimum<T: PartialOrd>(&mut self, name: &str, value: &T, minimum: T) {
         if value < &minimum {
             self.issue(Some(name), ValidationRule::Minimum, "is below the minimum");
@@ -379,6 +622,28 @@ impl<'values, V: Values> Decoder<'values, V> {
         }
     }
 
+    pub fn rest(&mut self) -> ExtraFields {
+        let mut entries = Vec::new();
+
+        for index in 0..self.values.len() {
+            if self.consumed[index] {
+                continue;
+            }
+
+            let Some(value) = self.values.value(index) else {
+                continue;
+            };
+
+            entries.push((value.name.to_owned(), value.bytes.to_vec()));
+            self.consumed[index] = true;
+        }
+
+        ExtraFields {
+            entries,
+            case_insensitive: self.values.names_are_case_insensitive(),
+        }
+    }
+
     pub fn finish(mut self) -> ValidationErrors {
         if self.options.unknown_fields == UnknownFields::Reject {
             let mut unknown = Vec::<String>::new();
@@ -392,7 +657,10 @@ impl<'values, V: Values> Decoder<'values, V> {
                     continue;
                 };
 
-                if unknown.iter().any(|name| name == value.name) {
+                if unknown
+                    .iter()
+                    .any(|name| self.values.name_matches(name, value.name))
+                {
                     continue;
                 }
 
@@ -446,6 +714,31 @@ impl<'values, V: Values> Decoder<'values, V> {
         indexes
     }
 
+    fn nested_values(&mut self, name: &str) -> NestedValues<'_> {
+        let prefix = format!("{name}.");
+        let mut values = Vec::new();
+
+        for index in 0..self.values.len() {
+            let Some(value) = self.values.value(index) else {
+                continue;
+            };
+            let Some(name) = self.values.strip_name_prefix(value.name, &prefix) else {
+                continue;
+            };
+
+            self.consumed[index] = true;
+            values.push(Value {
+                name,
+                bytes: value.bytes,
+            });
+        }
+
+        NestedValues {
+            values,
+            case_insensitive: self.values.names_are_case_insensitive(),
+        }
+    }
+
     fn decode_at<T: ValueSchema>(&mut self, name: &str, index: usize) -> Option<T> {
         let value = self.values.value(index)?;
 
@@ -465,5 +758,180 @@ impl<'values, V: Values> Decoder<'values, V> {
         message: impl Into<String>,
     ) {
         self.errors.push(ValidationIssue::new(field, rule, message));
+    }
+}
+
+fn nested_options<T: Schema>(parent: DecodeOptions) -> DecodeOptions {
+    DecodeOptions::new(T::UNKNOWN_FIELDS.unwrap_or(parent.unknown_fields()))
+}
+
+struct NestedValues<'values> {
+    values: Vec<Value<'values>>,
+    case_insensitive: bool,
+}
+
+impl Values for NestedValues<'_> {
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn value(&self, index: usize) -> Option<Value<'_>> {
+        self.values.get(index).copied()
+    }
+
+    fn name_matches(&self, actual: &str, expected: &str) -> bool {
+        if self.case_insensitive {
+            actual.eq_ignore_ascii_case(expected)
+        } else {
+            actual == expected
+        }
+    }
+
+    fn names_are_case_insensitive(&self) -> bool {
+        self.case_insensitive
+    }
+
+    fn strip_name_prefix<'name>(&self, actual: &'name str, prefix: &str) -> Option<&'name str> {
+        if self.case_insensitive
+            && actual
+                .get(..prefix.len())
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(prefix))
+        {
+            actual.get(prefix.len()..)
+        } else {
+            actual.strip_prefix(prefix)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DecodeOptions, Schema, SchemaKind, Value, ValueSchema, Values};
+
+    struct TestValues<'value> {
+        entries: Vec<(&'value str, &'value [u8])>,
+    }
+
+    impl Values for TestValues<'_> {
+        fn len(&self) -> usize {
+            self.entries.len()
+        }
+
+        fn value(&self, index: usize) -> Option<Value<'_>> {
+            self.entries
+                .get(index)
+                .map(|(name, bytes)| Value { name, bytes })
+        }
+    }
+
+    #[derive(Debug, PartialEq, crate::Schema)]
+    struct Filter {
+        name: String,
+        minimum: u32,
+    }
+
+    #[derive(Debug, PartialEq, crate::Schema)]
+    struct Search {
+        #[schema(nested)]
+        filter: Filter,
+        #[schema(nested)]
+        paging: Option<Paging>,
+    }
+
+    #[derive(Debug, PartialEq, crate::Schema)]
+    struct Paging {
+        page: u32,
+    }
+
+    #[derive(Debug, PartialEq, crate::Schema)]
+    #[schema(rename_all = "kebab-case")]
+    enum Mode {
+        FastMode,
+        #[schema(rename = "safe")]
+        SafeMode,
+    }
+
+    #[derive(Debug, PartialEq, crate::Schema)]
+    struct Wrapper<T> {
+        value: T,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Identifier(u64);
+
+    impl ValueSchema for Identifier {
+        fn decode_value(bytes: &[u8]) -> Result<Self, String> {
+            let value = std::str::from_utf8(bytes)
+                .map_err(|_| "must be valid UTF-8".to_owned())?
+                .parse()
+                .map_err(|_| "must be an identifier".to_owned())?;
+            Ok(Self(value))
+        }
+    }
+
+    #[test]
+    fn decodes_nested_fields_from_dotted_names() {
+        let values = TestValues {
+            entries: vec![("filter.name", b"gpu"), ("filter.minimum", b"4")],
+        };
+        let decoded = Search::decode(&values, DecodeOptions::reject_unknown()).unwrap();
+
+        assert_eq!(decoded.filter.name, "gpu");
+        assert_eq!(decoded.filter.minimum, 4);
+        assert_eq!(decoded.paging, None);
+    }
+
+    #[test]
+    fn derives_string_enums_with_rename_rules() {
+        let fast = TestValues {
+            entries: vec![("mode", b"fast-mode")],
+        };
+        let safe = TestValues {
+            entries: vec![("mode", b"safe")],
+        };
+
+        assert_eq!(
+            Mode::decode(&fast, DecodeOptions::reject_unknown()).unwrap(),
+            Mode::FastMode,
+        );
+        assert_eq!(
+            Mode::decode(&safe, DecodeOptions::reject_unknown()).unwrap(),
+            Mode::SafeMode,
+        );
+    }
+
+    #[test]
+    fn derives_generic_schemas() {
+        let values = TestValues {
+            entries: vec![("value", b"42")],
+        };
+        let decoded = Wrapper::<u64>::decode(&values, DecodeOptions::reject_unknown()).unwrap();
+
+        assert_eq!(decoded.value, 42);
+    }
+
+    #[test]
+    fn accepts_custom_value_schemas() {
+        let values = TestValues {
+            entries: vec![("value", b"91")],
+        };
+        let decoded =
+            Wrapper::<Identifier>::decode(&values, DecodeOptions::reject_unknown()).unwrap();
+
+        assert_eq!(decoded.value, Identifier(91));
+    }
+
+    #[test]
+    fn exposes_nested_openapi_metadata() {
+        let metadata = Search::metadata();
+        let SchemaKind::Object(fields) = metadata.kind() else {
+            panic!("expected object metadata");
+        };
+
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name(), "filter");
+        assert!(fields[0].required());
+        assert!(!fields[1].required());
+        assert!(matches!(fields[0].schema().kind(), SchemaKind::Object(_)));
     }
 }

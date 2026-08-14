@@ -2,35 +2,45 @@ use std::marker::PhantomData;
 
 use crate::{App, Handler, Method};
 
-pub struct Route<H, Arguments, Modes> {
+pub struct Route<H, Arguments, Input> {
     path: &'static str,
     method: Method,
     handler: H,
-    signature: PhantomData<fn() -> (Arguments, Modes)>,
+    signature: PhantomData<fn() -> (Arguments, Input)>,
 }
 
-pub trait RouteMethods {
-    #[allow(non_snake_case)]
-    fn GET<Arguments, Modes, H: Handler<Arguments, Modes>>(
-        self,
-        handler: H,
-    ) -> Route<H, Arguments, Modes>;
-}
-
-impl RouteMethods for &'static str {
-    #[allow(non_snake_case)]
-    fn GET<Arguments, Modes, H: Handler<Arguments, Modes>>(
-        self,
-        handler: H,
-    ) -> Route<H, Arguments, Modes> {
-        Route {
-            path: self,
-            method: Method::new("GET"),
-            handler,
-            signature: PhantomData,
+macro_rules! route_methods {
+    ($($method:ident),+ $(,)?) => {
+        #[allow(non_snake_case)]
+        pub trait RouteMethods {
+            $(
+                fn $method<Arguments, Input, H: Handler<Arguments, Input>>(
+                    self,
+                    handler: H,
+                ) -> Route<H, Arguments, Input>;
+            )+
         }
-    }
+
+        #[allow(non_snake_case)]
+        impl RouteMethods for &'static str {
+            $(
+                fn $method<Arguments, Input, H: Handler<Arguments, Input>>(
+                    self,
+                    handler: H,
+                ) -> Route<H, Arguments, Input> {
+                    Route {
+                        path: self,
+                        method: Method::new(stringify!($method)),
+                        handler,
+                        signature: PhantomData,
+                    }
+                }
+            )+
+        }
+    };
 }
+
+route_methods!(GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS);
 
 #[doc(hidden)]
 pub trait Routes {
@@ -41,8 +51,8 @@ impl Routes for () {
     fn apply(self, _application: &mut App) {}
 }
 
-impl<Arguments: 'static, Modes: 'static, H: Handler<Arguments, Modes> + 'static> Routes
-    for Route<H, Arguments, Modes>
+impl<Arguments: 'static, Input: 'static, H: Handler<Arguments, Input> + Send + Sync + 'static>
+    Routes for Route<H, Arguments, Input>
 {
     fn apply(self, application: &mut App) {
         application
@@ -89,8 +99,21 @@ mod tests {
         "0.1.0"
     }
 
+    async fn accepted() -> &'static str {
+        "accepted"
+    }
+
     #[test]
     fn routes_can_be_registered_with_an_app() {
-        let _application = App::new(("/health".GET(health), "/version".GET(version)));
+        let _application = App::new((
+            "/health".GET(health),
+            "/version".GET(version),
+            "/post".POST(accepted),
+            "/put".PUT(accepted),
+            "/patch".PATCH(accepted),
+            "/delete".DELETE(accepted),
+            "/head".HEAD(accepted),
+            "/options".OPTIONS(accepted),
+        ));
     }
 }
