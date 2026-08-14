@@ -1,0 +1,14 @@
+[package]
+name = "serverkit-cloudflare-worker-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serverkit = { path = "../..", features = ["websocket", "worker"] }
+worker = "0.8.5"
+
+[workspace]
