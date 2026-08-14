@@ -86,7 +86,7 @@ fn main() -> std::io::Result<()> {
 
 `App::new` accepts one route or a convenience tuple. `.route()` can then be
 called any number of times, so the number of routes in an application is not
-bounded by tuple arity. Handler functions may have zero through twelve
+bounded by tuple arity. Handler functions may have zero through sixteen
 extractor arguments. Metadata and buffered extractors may appear in any order.
 A streaming extractor such as `Body` or `Multipart`, when present, must be the
 final argument.
@@ -334,7 +334,7 @@ struct ConflictingPolicy {
 ## Schemaval rules
 
 The built-in scalar types are `String`, `Vec<u8>`, `bool`, all standard integer
-types, `f32`, and `f64`. Struct fields support:
+types, `f32`, `f64`, `Ipv4Addr`, `Ipv6Addr`, and `IpAddr`. Struct fields support:
 
 - required `T` values;
 - optional `Option<T>` values;
@@ -344,7 +344,9 @@ types, `f32`, and `f64`. Struct fields support:
 - `minimum`, `maximum`, `min_length`, and `max_length`;
 - field and whole-struct custom validation.
 - nested schemas through dotted input names;
-- generic schemas and string enums;
+- repeated nested schemas through indexed dotted input names;
+- generic schemas, string enums, and tagged data enums;
+- OpenAPI formats through `#[schema(format = "...")]`;
 - metadata used by the OpenAPI generator.
 
 ```rust
@@ -466,7 +468,9 @@ assert_eq!(
 ```
 
 Nested schemas use dotted names such as `filter.name`. `Option<T>` makes the
-entire nested object optional.
+entire nested object optional. Repeated nested schemas use names such as
+`filters.0.name` and `filters.1.name`. A default applies when no value under the
+nested prefix is present.
 
 ```rust
 use serverkit::Schema;
@@ -485,11 +489,50 @@ struct Search {
     paging: Option<Paging>,
 }
 
-#[derive(Schema)]
+#[derive(Default, Schema)]
 struct Paging {
     page: u32,
 }
+
+#[derive(Schema)]
+struct Request {
+    #[schema(nested)]
+    filters: Vec<Filter>,
+    #[schema(nested, default)]
+    paging: Paging,
+    #[schema(format = "uuid")]
+    request_id: String,
+}
 ```
+
+OpenAPI documents repeated nested leaves with an index placeholder such as
+`filters.{index}.name` and marks them with `x-serverkit-indexed: true`. Tagged
+enums are expanded into their discriminator and variant fields for path, query,
+and header parameters; fields that only belong to some variants are optional.
+
+Enums containing data use an explicit discriminator. Unit-only enums keep the
+single string representation shown above.
+
+```rust
+use serverkit::Schema;
+
+#[derive(Schema)]
+#[schema(tag = "type", rename_all = "snake_case")]
+enum Selection {
+    All,
+    Range {
+        start: u32,
+        end: u32,
+    },
+}
+```
+
+`type=range&start=1&end=10` decodes to `Selection::Range`. OpenAPI emits a
+`oneOf` schema with `type` as its discriminator.
+
+`format` changes OpenAPI metadata; it does not by itself validate a string.
+Combine it with `validate` for values such as UUIDs. The built-in IP address
+types perform real parsing and emit `ipv4` or `ipv6` formats automatically.
 
 Generic fields receive the required `ValueSchema` or `Schema` bounds from the
 derive automatically:
@@ -594,7 +637,7 @@ JSON returns HTTP 400.
 use serde::Deserialize;
 use serverkit::prelude::*;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Schema)]
 struct CreateUser {
     name: String,
 }
@@ -607,7 +650,9 @@ async fn create_user(Json(user): Json<CreateUser>) -> String {
 `Json<T>` requires `Content-Type: application/json` or a media type ending in
 `+json`. Unsupported media types return 415, malformed JSON returns 400, and
 the application body limit is checked before deserialization. Returning
-`Json<T>` serializes a JSON response with the matching content type.
+`Json<T>` serializes a JSON response with the matching content type. `T` also
+implements `Schema`, allowing request and response types to be emitted into
+OpenAPI `components/schemas` and referenced with `$ref`.
 
 ## Text, bytes, and forms
 
@@ -998,7 +1043,10 @@ request media types, and response types, then serves a Scalar API Reference at
 that path.
 
 ```rust
-use serverkit::{App, OpenApi, Path, RouteMethods, Schema};
+use serverkit::{
+    App, OpenApi, Path, RouteMethods, Scalar, ScalarDeveloperTools, Schema,
+    SchemaKind, SchemaMetadata, SecurityRequirement, SecurityScheme, Server,
+};
 
 #[derive(Schema)]
 struct ItemPath {
@@ -1009,8 +1057,36 @@ async fn item(Path(path): Path<ItemPath>) -> String {
     path.id.to_string()
 }
 
-let application = App::new("/items/:id".GET(item))
-    .openapi("/docs", OpenApi::new("Items API", "1.0.0"));
+let route = "/items/:id"
+    .GET(item)
+    .summary("Read an item")
+    .description("Reads one item by ID")
+    .tag("items")
+    .operation_id("readItem")
+    .openapi(|operation| {
+        operation
+            .security(SecurityRequirement::new("bearerAuth"))
+            .response_header(
+                200,
+                "X-Request-Id",
+                "Request identifier",
+                SchemaMetadata::new(SchemaKind::String).format("uuid"),
+            )
+            .response_example(200, "text/plain", "sample", "42");
+    });
+
+let document = OpenApi::new("Items API", "1.0.0")
+    .server(Server::new("https://api.example.com").description("Production"))
+    .security_scheme("bearerAuth", SecurityScheme::bearer())
+    .security(SecurityRequirement::new("bearerAuth"))
+    .scalar_config(
+        Scalar::new()
+            .theme("moon")
+            .show_sidebar(true)
+            .developer_tools(ScalarDeveloperTools::Localhost),
+    );
+
+let application = App::new(route).openapi("/docs", document);
 
 assert!(application
     .openapi_document()
@@ -1019,18 +1095,33 @@ assert!(application
     .contains("/items/{id}"));
 ```
 
-The serving path must be static. The page loads Scalar's official browser
-bundle from jsDelivr and embeds the OpenAPI document generated from the
+The serving path must be static. The page loads the pinned Scalar browser
+bundle `@scalar/api-reference@1.63.0` from jsDelivr and embeds the OpenAPI document generated from the
 application's current routes and schemas directly into Scalar's `content`
 configuration. It does not read a file or fetch a separate document endpoint.
 The page supports GET, HEAD, and OPTIONS; other methods return 405 with an
 `Allow` header. `App::openapi_document` provides direct access to the generated
 JSON in memory.
 
-Schemaval objects, nested objects, arrays, enums, scalar types, required fields,
-numeric limits, and length limits are rendered inline. `Json<T>` currently
-documents its media type but does not infer a JSON object schema from Serde
-alone.
+Named Schemaval types, including `Json<T>` request and response bodies, are
+deduplicated under `components/schemas` and referenced with `$ref`. Route
+builders expose summary, description, tags, operation IDs, and a custom
+`openapi` modifier. `OpenApi` supports servers, API key, HTTP bearer, OAuth2,
+and OpenID Connect security schemes. `Operation` supports request/response
+examples and response header schemas. Examples preserve JSON value types:
+
+```rust
+use serverkit::ExampleValue;
+
+let _example = ExampleValue::object([
+    ("name", ExampleValue::from("sample")),
+    ("count", ExampleValue::from(2_u32)),
+    ("active", ExampleValue::from(true)),
+]);
+```
+
+Pass an `ExampleValue` to `Operation::request_example` or
+`Operation::response_example`. String inputs remain accepted directly.
 
 ## Listener adapters
 

@@ -12,6 +12,14 @@ pub fn impl_handlers(input: TokenStream) -> TokenStream {
     }
 }
 
+#[proc_macro]
+pub fn impl_routes(input: TokenStream) -> TokenStream {
+    match expand_routes(input) {
+        Ok(output) => output,
+        Err(message) => compile_error(&message),
+    }
+}
+
 #[proc_macro_derive(Schema, attributes(schema))]
 pub fn derive_schema(input: TokenStream) -> TokenStream {
     match schema::expand(input) {
@@ -26,6 +34,24 @@ fn expand(input: TokenStream) -> Result<TokenStream, String> {
 
     for arity in 1..=maximum {
         output.push_str(&handler_invocation(arity)?);
+    }
+
+    TokenStream::from_str(&output).map_err(|error| error.to_string())
+}
+
+fn expand_routes(input: TokenStream) -> Result<TokenStream, String> {
+    let maximum = parse_maximum(input)?;
+    let mut output = String::new();
+
+    for arity in 1..=maximum {
+        output.push_str("impl_route_tuple!(");
+        for index in 1..=arity {
+            if index > 1 {
+                output.push(',');
+            }
+            write!(output, "R{index}").map_err(|error| error.to_string())?;
+        }
+        output.push_str(");");
     }
 
     TokenStream::from_str(&output).map_err(|error| error.to_string())

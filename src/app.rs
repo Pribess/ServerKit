@@ -170,6 +170,12 @@ mod tests {
         name: String,
     }
 
+    #[cfg(feature = "json")]
+    #[derive(crate::Schema, serde::Deserialize, serde::Serialize)]
+    struct JsonItem {
+        name: String,
+    }
+
     struct EmptyStream;
 
     impl RequestStream for EmptyStream {
@@ -187,6 +193,11 @@ mod tests {
 
     async fn create(Form(item): Form<CreateItem>) -> String {
         item.name
+    }
+
+    #[cfg(feature = "json")]
+    async fn create_json(crate::Json(item): crate::Json<JsonItem>) -> crate::Json<JsonItem> {
+        crate::Json(item)
     }
 
     fn request(method: &str, path: &str) -> Request {
@@ -214,8 +225,24 @@ mod tests {
 
     #[test]
     fn publishes_route_and_schema_metadata() {
-        let application = App::new(("/items/:id".GET(item), "/items".POST(create)))
-            .openapi("/docs", OpenApi::new("Items", "1.0"));
+        let application = App::new((
+            "/items/:id"
+                .GET(item)
+                .summary("Read an item")
+                .description("Reads one item by ID")
+                .tag("items")
+                .operation_id("readItem")
+                .openapi(|operation| {
+                    operation.response_header(
+                        200,
+                        "X-Request-Id",
+                        "Request identifier",
+                        crate::SchemaMetadata::new(crate::SchemaKind::String).format("uuid"),
+                    );
+                }),
+            "/items".POST(create),
+        ))
+        .openapi("/docs", OpenApi::new("Items", "1.0"));
         let document = application.openapi_document().unwrap().as_str();
 
         assert!(document.contains("\"/items/{id}\""));
@@ -223,6 +250,9 @@ mod tests {
         assert!(document.contains("\"name\":\"query\",\"in\":\"query\""));
         assert!(document.contains("application/x-www-form-urlencoded"));
         assert!(document.contains("\"413\""));
+        assert!(document.contains("\"summary\":\"Read an item\""));
+        assert!(document.contains("\"operationId\":\"readItem\""));
+        assert!(document.contains("\"X-Request-Id\""));
 
         #[cfg(feature = "json")]
         serde_json::from_str::<serde_json::Value>(document).unwrap();
@@ -264,5 +294,17 @@ mod tests {
         assert!(body.contains("/items/{id}"));
         assert!(!body.contains("Scalar.createApiReference('#app',{url:"));
         assert!(body.contains("https://cdn.jsdelivr.net/npm/@scalar/api-reference"));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn derives_json_request_and_response_components_from_schema() {
+        let application =
+            App::new("/items".POST(create_json)).openapi("/docs", OpenApi::new("Items", "1.0"));
+        let document = application.openapi_document().unwrap().as_str();
+
+        assert!(document.contains("\"application/json\":{\"schema\":{\"$ref\":"));
+        assert!(document.contains("\"components\":{\"schemas\":"));
+        serde_json::from_str::<serde_json::Value>(document).unwrap();
     }
 }

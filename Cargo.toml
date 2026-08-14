@@ -30,3 +30,6 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { version = "1", features = ["net", "rt"] }
 tokio-tungstenite = { version = "0.29", optional = true }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }

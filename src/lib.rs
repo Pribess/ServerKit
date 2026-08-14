@@ -48,7 +48,10 @@ pub use listener::Listener;
 
 pub use multipart::{Multipart, MultipartError, MultipartField};
 
-pub use openapi::{OpenApi, OpenApiDocument};
+pub use openapi::{
+    ApiKeyLocation, ExampleValue, OAuthFlow, OAuthFlows, OpenApi, OpenApiDocument, Operation,
+    ParameterLocation, Scalar, ScalarDeveloperTools, SecurityRequirement, SecurityScheme, Server,
+};
 
 pub use request::{Headers, InvalidHeader, Method, Request};
 
@@ -83,11 +86,13 @@ pub use websocket::{
 
 pub mod prelude {
     pub use crate::{
-        App, Body, DecodeOptions, ExtraFields, FromRequest, Handler, Header, HeaderError, Headers,
-        IntoResponse, Listener, Method, OpenApi, OpenApiDocument, Path, PathError, Query,
-        QueryError, Request, RequestStream, Response, ResponseBody, ResponseStream, Route,
-        RouteMethods, Schema, SchemaField, SchemaKind, SchemaMetadata, StreamError, UnknownFields,
-        ValidationErrors, ValidationIssue, ValidationRule, Value, ValueSchema, Values,
+        ApiKeyLocation, App, Body, DecodeOptions, ExampleValue, ExtraFields, FromRequest, Handler,
+        Header, HeaderError, Headers, IntoResponse, Listener, Method, OAuthFlow, OAuthFlows,
+        OpenApi, OpenApiDocument, Operation, ParameterLocation, Path, PathError, Query, QueryError,
+        Request, RequestStream, Response, ResponseBody, ResponseStream, Route, RouteMethods,
+        Scalar, ScalarDeveloperTools, Schema, SchemaField, SchemaKind, SchemaMetadata,
+        SecurityRequirement, SecurityScheme, Server, StreamError, UnknownFields, ValidationErrors,
+        ValidationIssue, ValidationRule, Value, ValueSchema, Values,
     };
 
     pub use crate::{

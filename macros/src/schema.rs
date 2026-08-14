@@ -161,7 +161,16 @@ fn expand_struct(input: &DeriveInput, data: &DataStruct) -> syn::Result<TokenStr
 
 fn expand_enum(input: &DeriveInput, data: &DataEnum) -> syn::Result<TokenStream2> {
     let attributes = Attributes::parse(&input.attrs)?;
-    attributes.validate_for_enum()?;
+    let tagged = data
+        .variants
+        .iter()
+        .any(|variant| !matches!(variant.fields, Fields::Unit));
+
+    if tagged {
+        return expand_tagged_enum(input, data, attributes);
+    }
+
+    attributes.validate_for_unit_enum()?;
     let rename_all = RenameAll::parse(attributes.rename_all.as_deref())?;
     let variants = data
         .variants
@@ -206,6 +215,126 @@ fn expand_enum(input: &DeriveInput, data: &DataEnum) -> syn::Result<TokenStream2
     })
 }
 
+fn expand_tagged_enum(
+    input: &DeriveInput,
+    data: &DataEnum,
+    attributes: Attributes,
+) -> syn::Result<TokenStream2> {
+    attributes.validate_for_tagged_enum()?;
+    let tag = attributes.tag.as_ref().ok_or_else(|| {
+        syn::Error::new_spanned(
+            &input.ident,
+            "an enum with data variants requires `#[schema(tag = \"...\")]`",
+        )
+    })?;
+    let rename_all = RenameAll::parse(attributes.rename_all.as_deref())?;
+    let variants = data
+        .variants
+        .iter()
+        .map(|variant| TaggedEnumVariant::parse(variant, rename_all, tag))
+        .collect::<syn::Result<Vec<_>>>()?;
+    let mut generics = input.generics.clone();
+    for variant in &variants {
+        add_field_bounds(&mut generics, &variant.fields);
+    }
+    let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
+    let name = &input.ident;
+    let unknown_fields = match attributes.unknown_fields.as_deref() {
+        None => quote!(::core::option::Option::None),
+        Some("reject") => quote!(::core::option::Option::Some(
+            ::serverkit::schemaval::UnknownFields::Reject
+        )),
+        Some("ignore") => quote!(::core::option::Option::Some(
+            ::serverkit::schemaval::UnknownFields::Ignore
+        )),
+        Some(value) => {
+            return Err(syn::Error::new_spanned(
+                &input.ident,
+                format!(
+                    "unsupported unknown_fields policy `{value}`; expected `reject` or `ignore`"
+                ),
+            ));
+        }
+    };
+    let decode_arms = variants
+        .iter()
+        .map(TaggedEnumVariant::decode_arm)
+        .collect::<syn::Result<Vec<_>>>()?;
+    let metadata_variants = variants
+        .iter()
+        .map(|variant| variant.metadata(tag))
+        .collect::<Vec<_>>();
+    let enum_validation = attributes.validate.map(|validate| {
+        quote! {
+            if let ::core::result::Result::Err(__schemaval_issue) =
+                #validate(&__schemaval_value)
+            {
+                return ::core::result::Result::Err(
+                    ::serverkit::schemaval::ValidationErrors::from_issue(
+                        __schemaval_issue,
+                    ),
+                );
+            }
+        }
+    });
+
+    Ok(quote! {
+        impl #impl_generics ::serverkit::schemaval::Schema
+            for #name #type_generics #where_clause
+        {
+            const UNKNOWN_FIELDS: ::core::option::Option<
+                ::serverkit::schemaval::UnknownFields
+            > = #unknown_fields;
+
+            fn decode<__SchemavalValues: ::serverkit::schemaval::Values>(
+                __schemaval_values: &__SchemavalValues,
+                __schemaval_options: ::serverkit::schemaval::DecodeOptions,
+            ) -> ::core::result::Result<
+                Self,
+                ::serverkit::schemaval::ValidationErrors,
+            > {
+                let mut __schemaval_decoder = ::serverkit::schemaval::Decoder::new(
+                    __schemaval_values,
+                    __schemaval_options,
+                );
+                let __schemaval_tag = __schemaval_decoder.required::<::std::string::String>(#tag);
+                let __schemaval_value = match __schemaval_tag.as_deref() {
+                    #(#decode_arms)*
+                    ::core::option::Option::Some(_) => {
+                        __schemaval_decoder.custom(
+                            #tag,
+                            ::core::result::Result::Err(
+                                ::serverkit::schemaval::ValidationIssue::custom(
+                                    "must be one of the declared enum variants",
+                                ),
+                            ),
+                        );
+                        ::core::option::Option::None
+                    }
+                    ::core::option::Option::None => ::core::option::Option::None,
+                };
+                let __schemaval_errors = __schemaval_decoder.finish();
+                let __schemaval_value = match __schemaval_value {
+                    ::core::option::Option::Some(value) if __schemaval_errors.is_empty() => value,
+                    _ => return ::core::result::Result::Err(__schemaval_errors),
+                };
+                #enum_validation
+                ::core::result::Result::Ok(__schemaval_value)
+            }
+
+            fn metadata() -> ::serverkit::schemaval::SchemaMetadata {
+                ::serverkit::schemaval::SchemaMetadata::named(
+                    ::core::any::type_name::<Self>(),
+                    ::serverkit::schemaval::SchemaKind::OneOf(
+                        ::std::vec![#(#metadata_variants),*],
+                    ),
+                )
+                .discriminator(#tag)
+            }
+        }
+    })
+}
+
 fn add_field_bounds(generics: &mut Generics, fields: &[FieldSchema]) {
     let where_clause = generics.make_where_clause();
 
@@ -233,6 +362,7 @@ struct FieldSchema {
     maximum: Option<Expr>,
     minimum_length: Option<Expr>,
     maximum_length: Option<Expr>,
+    format: Option<String>,
     validate: Option<Expr>,
 }
 
@@ -252,20 +382,6 @@ impl FieldSchema {
             return Err(syn::Error::new_spanned(
                 &field.ty,
                 format!("rest field `{ident}` must have type `ExtraFields`"),
-            ));
-        }
-
-        if attributes.nested && matches!(kind, FieldKind::Repeated) {
-            return Err(syn::Error::new_spanned(
-                &field.ty,
-                "repeated nested fields are not supported",
-            ));
-        }
-
-        if attributes.nested && attributes.default.is_some() {
-            return Err(syn::Error::new_spanned(
-                &field.ty,
-                "nested fields cannot use `default`",
             ));
         }
 
@@ -294,6 +410,7 @@ impl FieldSchema {
             maximum: attributes.maximum,
             minimum_length: attributes.minimum_length,
             maximum_length: attributes.maximum_length,
+            format: attributes.format,
             validate: attributes.validate,
         })
     }
@@ -313,14 +430,34 @@ impl FieldSchema {
         let value_type = &self.value_type;
         let field_type = &self.field_type;
         let decode = if self.nested {
-            match self.kind {
-                FieldKind::Required => quote!(
+            match (&self.kind, &self.default) {
+                (FieldKind::Required, None) => quote!(
                     __schemaval_decoder.required_nested::<#value_type>(#name)
                 ),
-                FieldKind::Optional => quote!(
+                (FieldKind::Required, Some(DefaultValue::Default)) => quote!(
+                    __schemaval_decoder.defaulted_nested::<#value_type, _>(
+                        #name,
+                        || ::core::default::Default::default(),
+                    )
+                ),
+                (FieldKind::Required, Some(DefaultValue::Expression(expression))) => quote!(
+                    __schemaval_decoder.defaulted_nested::<#value_type, _>(
+                        #name,
+                        || (#expression),
+                    )
+                ),
+                (FieldKind::Optional, None) => quote!(
                     __schemaval_decoder.optional_nested::<#value_type>(#name)
                 ),
-                FieldKind::Repeated => unreachable!(),
+                (FieldKind::Repeated, None) => quote!(
+                    __schemaval_decoder.repeated_nested::<#value_type>(#name)
+                ),
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        &self.field_type,
+                        format!("invalid nested field configuration for `{}`", self.ident),
+                    ));
+                }
             }
         } else {
             match (&self.kind, &self.default) {
@@ -430,6 +567,8 @@ impl FieldSchema {
         } else {
             quote!(<#value_type as ::serverkit::schemaval::ValueSchema>::metadata())
         };
+        let format = self.format.as_ref().map(|format| quote!(.format(#format)));
+        let base = quote!(#base #format);
         let schema = if matches!(self.kind, FieldKind::Repeated) {
             quote!(::serverkit::schemaval::SchemaMetadata::array(#base))
         } else {
@@ -500,6 +639,133 @@ struct EnumVariant {
     value: String,
 }
 
+struct TaggedEnumVariant {
+    ident: syn::Ident,
+    value: String,
+    fields: Vec<FieldSchema>,
+}
+
+impl TaggedEnumVariant {
+    fn parse(variant: &Variant, rename_all: RenameAll, tag: &str) -> syn::Result<Self> {
+        let attributes = Attributes::parse(&variant.attrs)?;
+        attributes.validate_for_variant(&variant.ident)?;
+        let value = attributes
+            .rename
+            .unwrap_or_else(|| rename_all.apply(&variant.ident.to_string()));
+        let fields = match &variant.fields {
+            Fields::Unit => Vec::new(),
+            Fields::Named(fields) => fields
+                .named
+                .iter()
+                .map(|field| FieldSchema::parse(field, RenameAll::None))
+                .collect::<syn::Result<Vec<_>>>()?,
+            Fields::Unnamed(_) => {
+                return Err(syn::Error::new_spanned(
+                    variant,
+                    "tagged Schema enums support unit and named-field variants",
+                ));
+            }
+        };
+
+        if fields.iter().any(|field| field.input_name == tag) {
+            return Err(syn::Error::new_spanned(
+                variant,
+                "an enum variant field cannot use the discriminator name",
+            ));
+        }
+        if fields.iter().filter(|field| field.rest).count() > 1 {
+            return Err(syn::Error::new_spanned(
+                variant,
+                "an enum variant can contain only one `rest` field",
+            ));
+        }
+
+        Ok(Self {
+            ident: variant.ident.clone(),
+            value,
+            fields,
+        })
+    }
+
+    fn decode_arm(&self) -> syn::Result<TokenStream2> {
+        let value = &self.value;
+        let ident = &self.ident;
+
+        if self.fields.is_empty() {
+            return Ok(quote! {
+                ::core::option::Option::Some(#value) => {
+                    ::core::option::Option::Some(Self::#ident)
+                }
+            });
+        }
+
+        let decodes = self
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| !field.rest)
+            .chain(
+                self.fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, field)| field.rest),
+            )
+            .map(|(index, field)| field.decode(index))
+            .collect::<syn::Result<Vec<_>>>()?;
+        let variables = (0..self.fields.len())
+            .map(|index| format_ident!("__schemaval_field_{index}"))
+            .collect::<Vec<_>>();
+        let field_names = self
+            .fields
+            .iter()
+            .map(|field| &field.ident)
+            .collect::<Vec<_>>();
+
+        Ok(quote! {
+            ::core::option::Option::Some(#value) => {
+                #(#decodes)*
+                match (#(#variables,)*) {
+                    (#(::core::option::Option::Some(#variables),)*) => {
+                        ::core::option::Option::Some(Self::#ident {
+                            #(#field_names: #variables,)*
+                        })
+                    }
+                    _ => ::core::option::Option::None,
+                }
+            }
+        })
+    }
+
+    fn metadata(&self, tag: &str) -> TokenStream2 {
+        let value = &self.value;
+        let fields = self
+            .fields
+            .iter()
+            .filter(|field| !field.rest)
+            .map(FieldSchema::metadata)
+            .collect::<Vec<_>>();
+
+        quote! {
+            ::serverkit::schemaval::SchemaMetadata::new(
+                ::serverkit::schemaval::SchemaKind::Object(
+                    ::std::vec![
+                        ::serverkit::schemaval::SchemaField::new(
+                            #tag,
+                            ::serverkit::schemaval::SchemaMetadata::new(
+                                ::serverkit::schemaval::SchemaKind::Literal(
+                                    #value.to_owned(),
+                                ),
+                            ),
+                            true,
+                        ),
+                        #(#fields),*
+                    ],
+                ),
+            )
+        }
+    }
+}
+
 impl EnumVariant {
     fn parse(variant: &Variant, rename_all: RenameAll) -> syn::Result<Self> {
         if !matches!(variant.fields, Fields::Unit) {
@@ -531,6 +797,8 @@ struct Attributes {
     maximum: Option<Expr>,
     minimum_length: Option<Expr>,
     maximum_length: Option<Expr>,
+    format: Option<String>,
+    tag: Option<String>,
     validate: Option<Expr>,
     unknown_fields: Option<String>,
     rest: bool,
@@ -576,6 +844,10 @@ impl Attributes {
                     parsed.minimum_length = Some(meta.value()?.parse()?);
                 } else if meta.path.is_ident("max_length") {
                     parsed.maximum_length = Some(meta.value()?.parse()?);
+                } else if meta.path.is_ident("format") {
+                    parsed.format = Some(meta.value()?.parse::<LitStr>()?.value());
+                } else if meta.path.is_ident("tag") {
+                    parsed.tag = Some(meta.value()?.parse::<LitStr>()?.value());
                 } else if meta.path.is_ident("validate") {
                     parsed.validate = Some(meta.value()?.parse()?);
                 } else if meta.path.is_ident("unknown_fields") {
@@ -598,6 +870,8 @@ impl Attributes {
             || self.maximum.is_some()
             || self.minimum_length.is_some()
             || self.maximum_length.is_some()
+            || self.format.is_some()
+            || self.tag.is_some()
             || self.rest
             || self.nested
         {
@@ -609,13 +883,15 @@ impl Attributes {
         Ok(())
     }
 
-    fn validate_for_enum(&self) -> syn::Result<()> {
+    fn validate_for_unit_enum(&self) -> syn::Result<()> {
         if self.rename.is_some()
             || self.default.is_some()
             || self.minimum.is_some()
             || self.maximum.is_some()
             || self.minimum_length.is_some()
             || self.maximum_length.is_some()
+            || self.format.is_some()
+            || self.tag.is_some()
             || self.validate.is_some()
             || self.unknown_fields.is_some()
             || self.rest
@@ -629,8 +905,27 @@ impl Attributes {
         Ok(())
     }
 
+    fn validate_for_tagged_enum(&self) -> syn::Result<()> {
+        if self.rename.is_some()
+            || self.default.is_some()
+            || self.minimum.is_some()
+            || self.maximum.is_some()
+            || self.minimum_length.is_some()
+            || self.maximum_length.is_some()
+            || self.format.is_some()
+            || self.rest
+            || self.nested
+        {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "tagged enum containers support `tag`, `rename_all`, `unknown_fields`, and `validate`",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_for_field(&self, ident: &syn::Ident) -> syn::Result<()> {
-        if self.rename_all.is_some() || self.unknown_fields.is_some() {
+        if self.rename_all.is_some() || self.unknown_fields.is_some() || self.tag.is_some() {
             return Err(syn::Error::new_spanned(
                 ident,
                 "field cannot use a struct-level schema attribute",
@@ -644,6 +939,7 @@ impl Attributes {
                 || self.maximum.is_some()
                 || self.minimum_length.is_some()
                 || self.maximum_length.is_some()
+                || self.format.is_some()
                 || self.validate.is_some()
                 || self.nested)
         {
@@ -662,6 +958,8 @@ impl Attributes {
             || self.maximum.is_some()
             || self.minimum_length.is_some()
             || self.maximum_length.is_some()
+            || self.format.is_some()
+            || self.tag.is_some()
             || self.validate.is_some()
             || self.unknown_fields.is_some()
             || self.rest

@@ -177,7 +177,7 @@ macro_rules! impl_handler {
     };
 }
 
-serverkit_macros::impl_handlers!(12);
+serverkit_macros::impl_handlers!(16);
 
 #[cfg(test)]
 mod tests {
@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn twelve(
+    async fn sixteen(
         _a0: Method,
         _a1: Method,
         _a2: Method,
@@ -304,6 +304,10 @@ mod tests {
         _a9: Method,
         _a10: Method,
         _a11: Method,
+        _a12: Method,
+        _a13: Method,
+        _a14: Method,
+        _a15: Method,
     ) {
     }
 
@@ -328,10 +332,14 @@ mod tests {
                 Method,
                 Method,
                 Method,
+                Method,
+                Method,
+                Method,
+                Method,
             ),
             (),
             _,
-        >(twelve);
+        >(sixteen);
     }
 
     #[test]

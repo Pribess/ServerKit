@@ -261,6 +261,7 @@ impl Router {
         method: Method,
         path: &'static str,
         handler: H,
+        operation: Operation,
     ) {
         let path = RoutePath::parse(path)
             .unwrap_or_else(|error| panic!("invalid route `{path}`: {error}"));
@@ -276,7 +277,7 @@ impl Router {
         self.routes.push(RegisteredRoute {
             method,
             path,
-            operation: H::openapi(),
+            operation,
             handler: Box::new(HandlerAdapter::<H, Arguments, Input>::new(handler)),
         });
     }

@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::BTreeSet, fmt, net};
 
 use crate::{IntoResponse, Response};
 
@@ -77,17 +77,26 @@ pub trait Schema: Sized {
 pub struct SchemaMetadata {
     name: Option<String>,
     kind: SchemaKind,
+    format: Option<String>,
+    discriminator: Option<String>,
 }
 
 impl SchemaMetadata {
     pub fn new(kind: SchemaKind) -> Self {
-        Self { name: None, kind }
+        Self {
+            name: None,
+            kind,
+            format: None,
+            discriminator: None,
+        }
     }
 
     pub fn named(name: impl Into<String>, kind: SchemaKind) -> Self {
         Self {
             name: Some(name.into()),
             kind,
+            format: None,
+            discriminator: None,
         }
     }
 
@@ -99,8 +108,26 @@ impl SchemaMetadata {
         self.name.as_deref()
     }
 
+    pub fn format(mut self, format: impl Into<String>) -> Self {
+        self.format = Some(format.into());
+        self
+    }
+
+    pub fn discriminator(mut self, property: impl Into<String>) -> Self {
+        self.discriminator = Some(property.into());
+        self
+    }
+
     pub fn kind(&self) -> &SchemaKind {
         &self.kind
+    }
+
+    pub fn format_value(&self) -> Option<&str> {
+        self.format.as_deref()
+    }
+
+    pub fn discriminator_property(&self) -> Option<&str> {
+        self.discriminator.as_deref()
     }
 }
 
@@ -114,6 +141,8 @@ pub enum SchemaKind {
     Object(Vec<SchemaField>),
     Enum(Vec<String>),
     Array(Box<SchemaMetadata>),
+    Literal(String),
+    OneOf(Vec<SchemaMetadata>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -424,6 +453,46 @@ value_schema!(Boolean: bool);
 value_schema!(Integer: u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
 value_schema!(Number: f32, f64);
 
+impl ValueSchema for net::Ipv4Addr {
+    fn decode_value(bytes: &[u8]) -> Result<Self, String> {
+        decode_from_str(bytes, "IPv4 address")
+    }
+
+    fn metadata() -> SchemaMetadata {
+        SchemaMetadata::new(SchemaKind::String).format("ipv4")
+    }
+}
+
+impl ValueSchema for net::Ipv6Addr {
+    fn decode_value(bytes: &[u8]) -> Result<Self, String> {
+        decode_from_str(bytes, "IPv6 address")
+    }
+
+    fn metadata() -> SchemaMetadata {
+        SchemaMetadata::new(SchemaKind::String).format("ipv6")
+    }
+}
+
+impl ValueSchema for net::IpAddr {
+    fn decode_value(bytes: &[u8]) -> Result<Self, String> {
+        decode_from_str(bytes, "IP address")
+    }
+
+    fn metadata() -> SchemaMetadata {
+        SchemaMetadata::new(SchemaKind::OneOf(vec![
+            <net::Ipv4Addr as ValueSchema>::metadata(),
+            <net::Ipv6Addr as ValueSchema>::metadata(),
+        ]))
+    }
+}
+
+fn decode_from_str<T: std::str::FromStr>(bytes: &[u8], expected: &str) -> Result<T, String> {
+    let value = std::str::from_utf8(bytes).map_err(|_| "must be valid UTF-8".to_owned())?;
+    value
+        .parse()
+        .map_err(|_| format!("must be a valid {expected}"))
+}
+
 impl<T: ValueSchema> Schema for T {
     fn decode<V: Values>(values: &V, options: DecodeOptions) -> Result<Self, ValidationErrors> {
         let mut decoder = Decoder::new(values, options);
@@ -582,6 +651,95 @@ impl<'values, V: Values> Decoder<'values, V> {
                 None
             }
         }
+    }
+
+    pub fn defaulted_nested<T: Schema, F: FnOnce() -> T>(
+        &mut self,
+        name: &str,
+        default: F,
+    ) -> Option<T> {
+        let options = nested_options::<T>(self.options);
+        let values = self.nested_values(name);
+
+        if values.is_empty() {
+            return Some(default());
+        }
+
+        match T::decode(&values, options) {
+            Ok(value) => Some(value),
+            Err(errors) => {
+                self.errors.extend_nested(name, errors);
+                None
+            }
+        }
+    }
+
+    pub fn repeated_nested<T: Schema>(&mut self, name: &str) -> Option<Vec<T>> {
+        let prefix = format!("{name}.");
+        let mut indexes = BTreeSet::new();
+        let mut valid = true;
+
+        for index in 0..self.values.len() {
+            let Some(value) = self.values.value(index) else {
+                continue;
+            };
+            let Some(remainder) = self.values.strip_name_prefix(value.name, &prefix) else {
+                continue;
+            };
+            let Some((item, field)) = remainder.split_once('.') else {
+                self.consumed[index] = true;
+                self.issue(
+                    Some(value.name),
+                    ValidationRule::InvalidType,
+                    "must use `<field>.<index>.<nested-field>`",
+                );
+                valid = false;
+                continue;
+            };
+
+            if field.is_empty() {
+                self.consumed[index] = true;
+                self.issue(
+                    Some(value.name),
+                    ValidationRule::InvalidType,
+                    "nested field name cannot be empty",
+                );
+                valid = false;
+                continue;
+            }
+
+            match item.parse::<usize>() {
+                Ok(item) => {
+                    indexes.insert(item);
+                }
+                Err(_) => {
+                    self.consumed[index] = true;
+                    self.issue(
+                        Some(value.name),
+                        ValidationRule::InvalidType,
+                        "nested item index must be a non-negative integer",
+                    );
+                    valid = false;
+                }
+            }
+        }
+
+        let mut decoded = Vec::with_capacity(indexes.len());
+        for index in indexes {
+            let item_name = format!("{name}.{index}");
+            let options = nested_options::<T>(self.options);
+            let values = self.nested_values(&item_name);
+
+            match T::decode(&values, options) {
+                Ok(value) => decoded.push(value),
+                Err(errors) => {
+                    self.errors.extend_nested(&item_name, errors);
+                    valid = false;
+                }
+            }
+        }
+
+        valid.then_some(decoded)
     }
 
     pub fn minimum<T: PartialOrd>(&mut self, name: &str, value: &T, minimum: T) {
@@ -838,9 +996,31 @@ mod tests {
         paging: Option<Paging>,
     }
 
-    #[derive(Debug, PartialEq, crate::Schema)]
+    #[derive(Debug, Default, PartialEq, crate::Schema)]
     struct Paging {
         page: u32,
+    }
+
+    #[derive(Debug, PartialEq, crate::Schema)]
+    struct NestedCollection {
+        #[schema(nested)]
+        filters: Vec<Filter>,
+        #[schema(nested, default)]
+        paging: Paging,
+    }
+
+    #[derive(Debug, PartialEq, crate::Schema)]
+    #[schema(tag = "type", rename_all = "snake_case")]
+    enum Selection {
+        All,
+        Range { start: u32, end: u32 },
+    }
+
+    #[derive(Debug, PartialEq, crate::Schema)]
+    struct Formatted {
+        address: std::net::IpAddr,
+        #[schema(format = "uuid")]
+        identifier: String,
     }
 
     #[derive(Debug, PartialEq, crate::Schema)]
@@ -933,5 +1113,60 @@ mod tests {
         assert!(fields[0].required());
         assert!(!fields[1].required());
         assert!(matches!(fields[0].schema().kind(), SchemaKind::Object(_)));
+    }
+
+    #[test]
+    fn decodes_repeated_nested_fields_and_nested_defaults() {
+        let values = TestValues {
+            entries: vec![
+                ("filters.0.name", b"gpu"),
+                ("filters.0.minimum", b"4"),
+                ("filters.1.name", b"cpu"),
+                ("filters.1.minimum", b"8"),
+            ],
+        };
+        let decoded = NestedCollection::decode(&values, DecodeOptions::reject_unknown()).unwrap();
+
+        assert_eq!(decoded.filters.len(), 2);
+        assert_eq!(decoded.filters[0].name, "gpu");
+        assert_eq!(decoded.filters[1].minimum, 8);
+        assert_eq!(decoded.paging, Paging::default());
+    }
+
+    #[test]
+    fn decodes_tagged_enums_with_named_data() {
+        let range = TestValues {
+            entries: vec![("type", b"range"), ("start", b"2"), ("end", b"9")],
+        };
+        let all = TestValues {
+            entries: vec![("type", b"all")],
+        };
+
+        assert_eq!(
+            Selection::decode(&range, DecodeOptions::reject_unknown()).unwrap(),
+            Selection::Range { start: 2, end: 9 },
+        );
+        assert_eq!(
+            Selection::decode(&all, DecodeOptions::reject_unknown()).unwrap(),
+            Selection::All,
+        );
+
+        let metadata = Selection::metadata();
+        assert_eq!(metadata.discriminator_property(), Some("type"));
+        assert!(matches!(metadata.kind(), SchemaKind::OneOf(variants) if variants.len() == 2));
+    }
+
+    #[test]
+    fn exposes_formats_and_decodes_standard_ip_types() {
+        let values = TestValues {
+            entries: vec![("address", b"127.0.0.1"), ("identifier", b"abc")],
+        };
+        let decoded = Formatted::decode(&values, DecodeOptions::reject_unknown()).unwrap();
+
+        assert_eq!(decoded.address, std::net::Ipv4Addr::LOCALHOST);
+        let SchemaKind::Object(fields) = Formatted::metadata().kind().clone() else {
+            panic!("expected object metadata");
+        };
+        assert_eq!(fields[1].schema().format_value(), Some("uuid"));
     }
 }

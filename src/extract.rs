@@ -503,7 +503,9 @@ impl IntoResponse for JsonError {
 }
 
 #[cfg(feature = "json")]
-impl<'request, T: DeserializeOwned> FromRequest<(&'request Request, &'request [u8])> for Json<T> {
+impl<'request, T: DeserializeOwned + Schema> FromRequest<(&'request Request, &'request [u8])>
+    for Json<T>
+{
     type Error = JsonError;
 
     const BUFFERED: bool = true;
@@ -526,7 +528,7 @@ impl<'request, T: DeserializeOwned> FromRequest<(&'request Request, &'request [u
     }
 
     fn openapi(operation: &mut Operation) {
-        operation.request_body("application/json", None, true);
+        operation.request_body("application/json", Some(T::metadata()), true);
         operation.response(400, "Invalid JSON request body", None, None);
         operation.response(413, "Request body is too large", None, None);
         operation.response(415, "Unsupported media type", None, None);
@@ -534,7 +536,7 @@ impl<'request, T: DeserializeOwned> FromRequest<(&'request Request, &'request [u
 }
 
 #[cfg(feature = "json")]
-impl<T: Serialize> IntoResponse for Json<T> {
+impl<T: Serialize + Schema> IntoResponse for Json<T> {
     fn into_response(self) -> Response {
         match serde_json::to_vec(&self.0) {
             Ok(body) => {
@@ -547,7 +549,12 @@ impl<T: Serialize> IntoResponse for Json<T> {
     }
 
     fn openapi(operation: &mut Operation) {
-        operation.response(200, "Success", Some("application/json"), None);
+        operation.response(
+            200,
+            "Success",
+            Some("application/json"),
+            Some(T::metadata()),
+        );
     }
 }
 
