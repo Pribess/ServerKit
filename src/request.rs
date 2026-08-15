@@ -179,7 +179,7 @@ pub struct Request {
     method: Method,
     path: String,
     query: Option<String>,
-    headers: Headers,
+    pub headers: Headers,
     params: Vec<(String, String)>,
     extensions: HashMap<TypeId, Box<dyn Any>>,
     states: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
@@ -218,10 +218,6 @@ impl Request {
 
     pub fn query(&self) -> Option<&str> {
         self.query.as_deref()
-    }
-
-    pub fn headers(&self) -> &Headers {
-        &self.headers
     }
 
     pub(crate) fn params(&self) -> &[(String, String)] {

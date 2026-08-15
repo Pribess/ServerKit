@@ -229,7 +229,7 @@ impl<'request> FromRequest<(&'request Request, &'request [u8])> for Cookies {
     type Error = Infallible;
 
     async fn from_request(input: (&'request Request, &'request [u8])) -> Result<Self, Self::Error> {
-        Ok(Cookies::from_headers(input.0.headers()))
+        Ok(Cookies::from_headers(&input.0.headers))
     }
 }
 
@@ -298,7 +298,7 @@ impl<'request, T: Schema> FromRequest<(&'request Request, &'request [u8])> for H
 
     async fn from_request(input: (&'request Request, &'request [u8])) -> Result<Self, Self::Error> {
         T::decode(
-            &HeaderValues::new(input.0.headers()),
+            &HeaderValues::new(&input.0.headers),
             schema_options::<T>(UnknownFields::Ignore),
         )
         .map(Self)
@@ -317,7 +317,7 @@ fn schema_options<T: Schema>(default: UnknownFields) -> DecodeOptions {
 
 pub(crate) fn content_type(request: &Request) -> Option<&str> {
     request
-        .headers()
+        .headers
         .get("content-type")
         .and_then(|value| std::str::from_utf8(value).ok())
 }

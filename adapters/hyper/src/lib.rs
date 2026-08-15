@@ -2,6 +2,7 @@
 
 use std::{
     convert::Infallible,
+    future::Future,
     io,
     net::{TcpListener, ToSocketAddrs},
     pin::Pin,
@@ -13,10 +14,10 @@ use hyper::{
     Request as HyperRequest, Response as HyperResponse,
     body::{Body as HyperBody, Bytes, Frame, Incoming, SizeHint},
     header::{CONTENT_LENGTH, HeaderName, HeaderValue},
-    server::conn::http1,
+    rt::Executor,
     service::service_fn,
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::{rt::TokioIo, server::conn::auto};
 
 #[cfg(feature = "websocket")]
 use futures_util::{Sink, Stream};
@@ -40,11 +41,11 @@ use serverkit::{
     adapter::{WebSocketIo, WebSocketPlan},
 };
 
-pub struct Http1 {
+pub struct Http {
     listener: TcpListener,
 }
 
-impl Http1 {
+impl Http {
     pub fn bind(address: impl ToSocketAddrs) -> io::Result<Self> {
         TcpListener::bind(address).map(Self::from_listener)
     }
@@ -54,7 +55,7 @@ impl Http1 {
     }
 }
 
-impl Listener for Http1 {
+impl Listener for Http {
     type Output = io::Result<()>;
 
     fn serve(self, router: Router) -> Self::Output {
@@ -98,9 +99,26 @@ async fn serve_connection(
         async move { Ok::<_, Infallible>(handle_request(router, request, address).await) }
     });
 
-    let _result = http1::Builder::new()
+    let builder = auto::Builder::new(LocalExecutor);
+
+    #[cfg(feature = "websocket")]
+    let _result = builder
+        .serve_connection_with_upgrades(TokioIo::new(connection), service)
+        .await;
+
+    #[cfg(not(feature = "websocket"))]
+    let _result = builder
         .serve_connection(TokioIo::new(connection), service)
         .await;
+}
+
+#[derive(Clone, Copy)]
+struct LocalExecutor;
+
+impl<F: Future<Output = ()> + 'static> Executor<F> for LocalExecutor {
+    fn execute(&self, future: F) {
+        tokio::task::spawn_local(future);
+    }
 }
 
 async fn handle_request(
@@ -384,5 +402,94 @@ fn into_hyper_message(message: WebSocketMessage) -> Message {
             code: CloseCode::from(code),
             reason: reason.into(),
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::TcpListener, rc::Rc};
+
+    use http_body_util::Empty;
+    use hyper::{Request, body::Bytes, client::conn::http2};
+    use hyper_util::rt::TokioIo;
+    use serverkit::{Config, RouteMethods, Router};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{LocalExecutor, serve_connection};
+
+    fn router() -> Router {
+        Router::new(Config::new(), "/health".GET(|| async { "ok" }))
+    }
+
+    fn listener() -> (TcpListener, std::net::SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        (listener, address)
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap()
+    }
+
+    fn request_http_1(version: &str) -> String {
+        let (listener, address) = listener();
+        let runtime = runtime();
+
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let server = tokio::task::spawn_local(async move {
+                let (connection, peer) = listener.accept().await.unwrap();
+                serve_connection(Rc::new(router()), connection, peer).await;
+            });
+            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            let request =
+                format!("GET /health {version}\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            client.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            server.await.unwrap();
+
+            String::from_utf8(response).unwrap()
+        })
+    }
+
+    #[test]
+    fn serves_http_1_0_and_http_1_1() {
+        assert!(request_http_1("HTTP/1.0").starts_with("HTTP/1.0 200 OK"));
+        assert!(request_http_1("HTTP/1.1").starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn serves_http_2() {
+        let (listener, address) = listener();
+        let runtime = runtime();
+
+        tokio::task::LocalSet::new().block_on(&runtime, async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            tokio::task::spawn_local(async move {
+                let (connection, peer) = listener.accept().await.unwrap();
+                serve_connection(Rc::new(router()), connection, peer).await;
+            });
+            let client = tokio::net::TcpStream::connect(address).await.unwrap();
+            let (mut sender, connection) = http2::Builder::new(LocalExecutor)
+                .handshake(TokioIo::new(client))
+                .await
+                .unwrap();
+            tokio::task::spawn_local(async move {
+                connection.await.unwrap();
+            });
+            let request = Request::builder()
+                .uri("http://localhost/health")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let response = sender.send_request(request).await.unwrap();
+
+            assert_eq!(response.version(), hyper::Version::HTTP_2);
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+        });
     }
 }

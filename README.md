@@ -1,9 +1,9 @@
 # ServerKit
 
 ServerKit is a portable Rust HTTP router with an Ohkami-inspired routing API.
-The core stays runtime-independent; `serverkit-hyper` provides native HTTP/1
-serving and `serverkit-worker` connects the same `Router`, routes, handlers, and
-extractors to Cloudflare Workers.
+The core stays runtime-independent; `serverkit-hyper` provides native HTTP/1.0,
+HTTP/1.1, and HTTP/2 serving while `serverkit-worker` connects the same `Router`,
+routes, handlers, and extractors to Cloudflare Workers.
 
 ## Installation
 
@@ -28,7 +28,7 @@ parameters, and headers by name.
 
 ```rust,ignore
 use serverkit::prelude::*;
-use serverkit_hyper::Http1;
+use serverkit_hyper::Http;
 
 #[derive(Schema)]
 struct UserPath {
@@ -77,9 +77,13 @@ fn main() -> std::io::Result<()> {
         "/:organization/users/:id".GET(get_user),
     ));
 
-    router.run(Http1::bind("127.0.0.1:3000")?)
+    router.run(Http::bind("127.0.0.1:3000")?)
 }
 ```
+
+`Http` automatically detects HTTP/1.0, HTTP/1.1, and HTTP/2 after accepting a
+connection. TLS and HTTP/3 are separate transport concerns and are not provided
+by this adapter.
 
 `Router::new` accepts one route or a convenience tuple. `.route()` can then be
 called any number of times, so the number of routes in a router is not
@@ -241,11 +245,23 @@ struct Authentication;
 
 impl Middleware for Authentication {
     async fn handle(&self, request: Request, next: Next<'_>) -> Response {
-        if request.headers().contains("Authorization") {
+        if request.headers.contains("Authorization") {
             next.run(request).await
         } else {
             Response::text(401, "Unauthorized")
         }
+    }
+}
+
+struct RequestId;
+
+impl Middleware for RequestId {
+    async fn handle(&self, mut request: Request, next: Next<'_>) -> Response {
+        request
+            .headers
+            .set("X-Request-Id", "generated")
+            .unwrap();
+        next.run(request).await
     }
 }
 
@@ -265,6 +281,7 @@ let api = Router::new(
 
 let router = Router::new(Config::new(), ())
     .middleware(Trace)
+    .middleware(RequestId)
     .route(api);
 ```
 
@@ -859,7 +876,7 @@ impl<'request> FromRequest<(&'request Request, &'request [u8])> for UserAgent {
     ) -> Result<Self, Self::Error> {
         let value = input
             .0
-            .headers()
+            .headers
             .get("user-agent")
             .ok_or_else(|| Response::text(400, "missing user-agent"))?;
         let value = std::str::from_utf8(value)
@@ -1003,7 +1020,7 @@ all values of a name. Public writes validate header names and reject CR/LF/NUL
 in values.
 
 `Response::stream` accepts a runtime-neutral `ResponseStream` and is forwarded
-without buffering by both native HTTP/1 and Cloudflare Workers.
+without buffering by both native HTTP and Cloudflare Workers.
 
 ```rust
 use std::task::{Context, Poll};
@@ -1071,7 +1088,7 @@ async fn events() -> Sse<Events> {
 ## WebSockets
 
 Enable the `websocket` feature. The same upgrade handler and message API works
-with native HTTP/1 and Cloudflare Workers.
+with native HTTP/1.1 and Cloudflare Workers.
 
 ```rust,ignore
 use serverkit::{Response, WebSocketMessage, WebSocketUpgrade};
@@ -1194,9 +1211,9 @@ Pass an `ExampleValue` to `Operation::request_example` or
 ## Listener adapters
 
 `Router::run` dispatches to the `Listener` implementation of the value passed by
-the user. `serverkit_hyper::Http1` owns a `std::net::TcpListener` and implements
-that trait. Other runtimes can expose their own local wrapper type and implement
-the same trait.
+the user. `serverkit_hyper::Http` owns a `std::net::TcpListener`, automatically
+serves HTTP/1.0, HTTP/1.1, or HTTP/2, and implements that trait. Other runtimes
+can expose their own local wrapper type and implement the same trait.
 
 ```rust
 use serverkit::{Config, Listener, Router};

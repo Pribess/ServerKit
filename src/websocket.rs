@@ -182,7 +182,7 @@ impl<'request> FromRequest<(&'request Request, &'request [u8])> for WebSocketUpg
     type Error = WebSocketUpgradeError;
 
     async fn from_request(input: (&'request Request, &'request [u8])) -> Result<Self, Self::Error> {
-        let headers = input.0.headers();
+        let headers = &input.0.headers;
         let upgrade = header_text(headers.get("upgrade"));
         let connection = header_text(headers.get("connection"));
 

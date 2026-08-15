@@ -88,6 +88,7 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
     use std::{
+        convert::Infallible,
         future::Future,
         sync::{
             Arc, Mutex,
@@ -97,8 +98,8 @@ mod tests {
     };
 
     use crate::{
-        Config, Headers, Method, Middleware, Next, Request, RequestStream, Response, RouteMethods,
-        Router, StreamError,
+        Config, FromRequest, Headers, Method, Middleware, Next, Request, RequestStream, Response,
+        RouteMethods, Router, StreamError,
     };
 
     struct EmptyStream;
@@ -139,10 +140,39 @@ mod tests {
 
     struct Authentication(Arc<AtomicUsize>);
 
+    struct InjectHeader;
+
+    struct InjectedHeader(String);
+
     impl Middleware for Authentication {
         async fn handle(&self, request: Request, next: Next<'_>) -> Response {
             self.0.fetch_add(1, Ordering::Relaxed);
             next.run(request).await
+        }
+    }
+
+    impl Middleware for InjectHeader {
+        async fn handle(&self, mut request: Request, next: Next<'_>) -> Response {
+            request.headers.set("X-Injected", "middleware").unwrap();
+            next.run(request).await
+        }
+    }
+
+    impl<'request> FromRequest<(&'request Request, &'request [u8])> for InjectedHeader {
+        type Error = Infallible;
+
+        async fn from_request(
+            input: (&'request Request, &'request [u8]),
+        ) -> Result<Self, Self::Error> {
+            let value = input
+                .0
+                .headers
+                .get("X-Injected")
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .unwrap_or_default()
+                .to_owned();
+
+            Ok(Self(value))
         }
     }
 
@@ -236,6 +266,19 @@ mod tests {
 
         assert_eq!(block_on(router.handle(request("/missing"))).status(), 404,);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn middleware_can_modify_request_headers_before_extraction() {
+        let router = Router::new(
+            Config::new(),
+            "/header".GET(|InjectedHeader(value): InjectedHeader| async move { value }),
+        )
+        .middleware(InjectHeader);
+
+        let response = block_on(router.handle(request("/header")));
+
+        assert_eq!(response.body(), b"middleware");
     }
 
     #[test]
