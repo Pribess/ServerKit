@@ -223,9 +223,14 @@ impl HyperBody for HyperResponseBody {
                 let bytes = Bytes::from(std::mem::take(bytes));
                 Poll::Ready(Some(Ok(Frame::data(bytes))))
             }
-            ResponseBody::Streaming(stream) => stream
-                .poll_next(context)
-                .map(|next| next.map(|chunk| chunk.map(Bytes::from).map(Frame::data))),
+            ResponseBody::Streaming(stream) => match stream.poll_next(context) {
+                Poll::Ready(Some(Ok(()))) => Poll::Ready(Some(Ok(Frame::data(
+                    Bytes::copy_from_slice(stream.chunk()),
+                )))),
+                Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            },
             #[cfg(feature = "websocket")]
             ResponseBody::WebSocket(_) => Poll::Ready(None),
         }

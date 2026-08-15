@@ -1021,27 +1021,43 @@ in values.
 
 `Response::stream` accepts a runtime-neutral `ResponseStream` and is forwarded
 without buffering by both native HTTP and Cloudflare Workers.
+`poll_next` advances the stream, and `chunk` borrows bytes owned by the stream
+until its next mutable call. Implementations can therefore reuse one allocation
+instead of allocating and transferring a new `Vec<u8>` for every chunk. The
+current Hyper and Workers host APIs require owned output values, so their
+adapters copy each borrowed chunk at that final boundary.
 
 ```rust
 use std::task::{Context, Poll};
 use serverkit::{Response, ResponseStream, StreamError};
 
 struct Chunks {
-    chunk: Option<Vec<u8>>,
+    chunk: Vec<u8>,
+    sent: bool,
 }
 
 impl ResponseStream for Chunks {
     fn poll_next(
         &mut self,
         _context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, StreamError>>> {
-        Poll::Ready(self.chunk.take().map(Ok))
+    ) -> Poll<Option<Result<(), StreamError>>> {
+        if self.sent {
+            Poll::Ready(None)
+        } else {
+            self.sent = true;
+            Poll::Ready(Some(Ok(())))
+        }
+    }
+
+    fn chunk(&self) -> &[u8] {
+        &self.chunk
     }
 }
 
 async fn stream() -> Response {
     Response::stream(200, Chunks {
-        chunk: Some(b"chunk".to_vec()),
+        chunk: b"chunk".to_vec(),
+        sent: false,
     })
 }
 ```

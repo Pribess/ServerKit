@@ -28,6 +28,7 @@ impl<S: SseStream + 'static> IntoResponse for Sse<S> {
             200,
             EncodedSseStream {
                 stream: self.stream,
+                current: Vec::new(),
             },
         );
         response
@@ -83,59 +84,79 @@ impl SseEvent {
         self
     }
 
+    #[cfg(test)]
     fn encode(self) -> Vec<u8> {
-        let mut encoded = String::new();
+        let mut encoded = Vec::new();
+        self.encode_into(&mut encoded);
+        encoded
+    }
+
+    fn encode_into(self, encoded: &mut Vec<u8>) {
+        encoded.clear();
 
         if let Some(event) = self.event {
-            encoded.push_str("event: ");
-            encoded.push_str(&sanitize(&event));
-            encoded.push('\n');
+            encoded.extend_from_slice(b"event: ");
+            extend_sanitized(encoded, &event);
+            encoded.push(b'\n');
         }
 
         if let Some(id) = self.id {
-            encoded.push_str("id: ");
-            encoded.push_str(&sanitize(&id));
-            encoded.push('\n');
+            encoded.extend_from_slice(b"id: ");
+            extend_sanitized(encoded, &id);
+            encoded.push(b'\n');
         }
 
         if let Some(retry) = self.retry {
-            encoded.push_str("retry: ");
-            encoded.push_str(&retry.as_millis().to_string());
-            encoded.push('\n');
+            encoded.extend_from_slice(b"retry: ");
+            encoded.extend_from_slice(retry.as_millis().to_string().as_bytes());
+            encoded.push(b'\n');
         }
 
         for line in self.data.lines() {
-            encoded.push_str("data: ");
-            encoded.push_str(line);
-            encoded.push('\n');
+            encoded.extend_from_slice(b"data: ");
+            encoded.extend_from_slice(line.as_bytes());
+            encoded.push(b'\n');
         }
 
         if self.data.is_empty() {
-            encoded.push_str("data:\n");
+            encoded.extend_from_slice(b"data:\n");
         }
 
-        encoded.push('\n');
-        encoded.into_bytes()
+        encoded.push(b'\n');
     }
 }
 
 struct EncodedSseStream<S> {
     stream: S,
+    current: Vec<u8>,
 }
 
 impl<S: SseStream> ResponseStream for EncodedSseStream<S> {
-    fn poll_next(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, StreamError>>> {
-        self.stream
-            .poll_next(context)
-            .map(|next| next.map(|event| event.map(SseEvent::encode)))
+    fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Result<(), StreamError>>> {
+        match self.stream.poll_next(context) {
+            Poll::Ready(Some(Ok(event))) => {
+                event.encode_into(&mut self.current);
+                Poll::Ready(Some(Ok(())))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.current.clear();
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.current.clear();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn chunk(&self) -> &[u8] {
+        &self.current
     }
 }
 
-fn sanitize(value: &str) -> String {
-    value.replace(['\r', '\n'], "")
+fn extend_sanitized(encoded: &mut Vec<u8>, value: &str) {
+    encoded.extend(value.bytes().filter(|byte| !matches!(byte, b'\r' | b'\n')));
 }
 
 #[cfg(test)]

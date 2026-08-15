@@ -17,10 +17,14 @@ pub trait RequestStream {
 }
 
 pub trait ResponseStream {
-    fn poll_next(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, StreamError>>>;
+    /// Advances to the next chunk without transferring its allocation.
+    ///
+    /// After returning `Poll::Ready(Some(Ok(())))`, `chunk` must expose the
+    /// new chunk until the next mutable call to this stream.
+    fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Result<(), StreamError>>>;
+
+    /// Borrows the chunk produced by the latest successful `poll_next` call.
+    fn chunk(&self) -> &[u8];
 }
 
 #[derive(Debug)]

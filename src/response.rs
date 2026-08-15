@@ -235,18 +235,32 @@ impl<T: IntoResponse, E: IntoResponse> IntoResponse for Result<T, E> {
 
 #[cfg(test)]
 mod tests {
-    use std::task::{Context, Poll};
+    use std::task::{Context, Poll, Waker};
 
-    use crate::{Cookie, IntoResponse, Redirect, Response, ResponseStream, StreamError};
+    use crate::{
+        Cookie, IntoResponse, Redirect, Response, ResponseBody, ResponseStream, StreamError,
+    };
 
-    struct OneChunk(Option<Vec<u8>>);
+    struct OneChunk {
+        chunk: Vec<u8>,
+        sent: bool,
+    }
 
     impl ResponseStream for OneChunk {
         fn poll_next(
             &mut self,
             _context: &mut Context<'_>,
-        ) -> Poll<Option<Result<Vec<u8>, StreamError>>> {
-            Poll::Ready(self.0.take().map(Ok))
+        ) -> Poll<Option<Result<(), StreamError>>> {
+            if self.sent {
+                Poll::Ready(None)
+            } else {
+                self.sent = true;
+                Poll::Ready(Some(Ok(())))
+            }
+        }
+
+        fn chunk(&self) -> &[u8] {
+            &self.chunk
         }
     }
 
@@ -293,8 +307,26 @@ mod tests {
 
     #[test]
     fn creates_streaming_responses_and_redirects() {
-        let response = Response::stream(200, OneChunk(Some(b"chunk".to_vec())));
+        let response = Response::stream(
+            200,
+            OneChunk {
+                chunk: b"chunk".to_vec(),
+                sent: false,
+            },
+        );
         assert!(response.is_streaming());
+
+        let (_, _, ResponseBody::Streaming(mut stream)) = response.into_parts() else {
+            panic!("expected a streaming response");
+        };
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            stream.poll_next(&mut context),
+            Poll::Ready(Some(Ok(())))
+        ));
+        assert_eq!(stream.chunk(), b"chunk");
+        assert!(matches!(stream.poll_next(&mut context), Poll::Ready(None)));
 
         let mut redirect = Redirect::temporary("/next").into_response();
         assert_eq!(redirect.status(), 307);
