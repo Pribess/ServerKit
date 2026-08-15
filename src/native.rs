@@ -29,7 +29,7 @@ use tokio_tungstenite::{
 };
 
 use crate::{
-    App, Headers, Listener, Method, Request, RequestStream, Response, ResponseBody, StreamError,
+    Headers, Listener, Method, Request, RequestStream, Response, ResponseBody, Router, StreamError,
 };
 
 #[cfg(feature = "websocket")]
@@ -41,12 +41,12 @@ use crate::{
 impl Listener for TcpListener {
     type Output = io::Result<()>;
 
-    fn serve(self, application: App) -> Self::Output {
-        serve(application, self)
+    fn serve(self, router: Router) -> Self::Output {
+        serve(router, self)
     }
 }
 
-fn serve(application: App, listener: TcpListener) -> io::Result<()> {
+fn serve(router: Router, listener: TcpListener) -> io::Result<()> {
     listener.set_nonblocking(true)?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -54,32 +54,32 @@ fn serve(application: App, listener: TcpListener) -> io::Result<()> {
         .build()?;
     let tasks = tokio::task::LocalSet::new();
 
-    tasks.block_on(&runtime, serve_connections(application, listener))
+    tasks.block_on(&runtime, serve_connections(router, listener))
 }
 
-async fn serve_connections(application: App, listener: TcpListener) -> io::Result<()> {
+async fn serve_connections(router: Router, listener: TcpListener) -> io::Result<()> {
     let listener = tokio::net::TcpListener::from_std(listener)?;
-    let application = Rc::new(application);
+    let router = Rc::new(router);
 
     loop {
         let (connection, address) = listener.accept().await?;
-        let application = Rc::clone(&application);
+        let router = Rc::clone(&router);
 
         tokio::task::spawn_local(async move {
-            serve_connection(application, connection, address).await;
+            serve_connection(router, connection, address).await;
         });
     }
 }
 
 async fn serve_connection(
-    application: Rc<App>,
+    router: Rc<Router>,
     connection: tokio::net::TcpStream,
     address: std::net::SocketAddr,
 ) {
     let service = service_fn(move |request| {
-        let application = Rc::clone(&application);
+        let router = Rc::clone(&router);
 
-        async move { Ok::<_, Infallible>(handle_request(application, request, address).await) }
+        async move { Ok::<_, Infallible>(handle_request(router, request, address).await) }
     });
 
     let _result = http1::Builder::new()
@@ -88,7 +88,7 @@ async fn serve_connection(
 }
 
 async fn handle_request(
-    application: Rc<App>,
+    router: Rc<Router>,
     request: HyperRequest<Incoming>,
     address: std::net::SocketAddr,
 ) -> HyperResponse<NativeResponseBody> {
@@ -113,7 +113,7 @@ async fn handle_request(
     request.insert_extension(address);
     #[cfg(feature = "websocket")]
     request.insert_extension(native_upgrade);
-    let response = application.handle(request).await;
+    let response = router.handle(request).await;
 
     into_native_response(response)
 }

@@ -1,7 +1,16 @@
-use std::{cmp::Ordering, future::Future, marker::PhantomData, pin::Pin};
+use std::{
+    any::{Any, TypeId},
+    cmp::Ordering,
+    collections::HashMap,
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    sync::Arc,
+};
 
 use crate::{
     Handler, Method, Request, Response,
+    middleware::{MiddlewareEntry, MiddlewareFuture, MiddlewareTerminal},
     openapi::{Operation, RouteDescription},
 };
 
@@ -33,11 +42,13 @@ impl<Arguments, Input, H: Handler<Arguments, Input> + Send + Sync> ErasedHandler
     }
 }
 
-struct RegisteredRoute {
+pub(crate) struct RegisteredRoute {
     method: Method,
     path: RoutePath,
     handler: Box<dyn ErasedHandler>,
     operation: Operation,
+    middlewares: Vec<MiddlewareEntry>,
+    excluded_middlewares: Vec<TypeId>,
 }
 
 struct RoutePath {
@@ -234,21 +245,77 @@ fn path_segments(path: &str) -> Vec<&str> {
     }
 }
 
-pub(crate) struct Router {
+pub(crate) struct Dispatcher {
     routes: Vec<RegisteredRoute>,
     fallbacks: Vec<RegisteredFallback>,
+    scopes: Vec<Scope>,
 }
 
-struct RegisteredFallback {
+pub(crate) struct Scope {
+    prefix: String,
+    middlewares: Vec<MiddlewareEntry>,
+    states: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+    body_limit: Option<usize>,
+}
+
+impl Scope {
+    pub(crate) fn new(prefix: String) -> Self {
+        Self {
+            prefix,
+            middlewares: Vec::new(),
+            states: HashMap::new(),
+            body_limit: None,
+        }
+    }
+
+    pub(crate) fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    pub(crate) fn middlewares(&self) -> &[MiddlewareEntry] {
+        &self.middlewares
+    }
+
+    pub(crate) fn states(&self) -> &HashMap<TypeId, Arc<dyn Any + Send + Sync>> {
+        &self.states
+    }
+
+    pub(crate) fn configured_body_limit(&self) -> Option<usize> {
+        self.body_limit
+    }
+
+    pub(crate) fn middleware(&mut self, middleware: MiddlewareEntry) {
+        self.middlewares.push(middleware);
+    }
+
+    pub(crate) fn state<T: Send + Sync + 'static>(&mut self, state: T) {
+        self.states.insert(TypeId::of::<T>(), Arc::new(state));
+    }
+
+    pub(crate) fn body_limit(&mut self, limit: usize) {
+        self.body_limit = Some(limit);
+    }
+
+    pub(crate) fn matches(&self, path: &str) -> bool {
+        prefix_matches(&self.prefix, path)
+    }
+
+    pub(crate) fn prepend(&mut self, prefix: &str) {
+        self.prefix = join_prefixes(prefix, &self.prefix);
+    }
+}
+
+pub(crate) struct RegisteredFallback {
     prefix: String,
     handler: Box<dyn ErasedHandler>,
 }
 
-impl Router {
+impl Dispatcher {
     pub(crate) fn new() -> Self {
         Self {
             routes: Vec::new(),
             fallbacks: Vec::new(),
+            scopes: Vec::new(),
         }
     }
 
@@ -259,11 +326,14 @@ impl Router {
     >(
         &mut self,
         method: Method,
-        path: &'static str,
+        path: impl Into<String>,
         handler: H,
         operation: Operation,
+        middlewares: Vec<MiddlewareEntry>,
+        excluded_middlewares: Vec<TypeId>,
     ) {
-        let path = RoutePath::parse(path)
+        let path = path.into();
+        let path = RoutePath::parse(&path)
             .unwrap_or_else(|error| panic!("invalid route `{path}`: {error}"));
 
         if self
@@ -278,6 +348,8 @@ impl Router {
             method,
             path,
             operation,
+            middlewares,
+            excluded_middlewares,
             handler: Box::new(HandlerAdapter::<H, Arguments, Input>::new(handler)),
         });
     }
@@ -288,31 +360,25 @@ impl Router {
         H: Handler<Arguments, Input> + Send + Sync + 'static,
     >(
         &mut self,
+        prefix: &str,
         handler: H,
     ) {
         if self
             .fallbacks
             .iter()
-            .any(|fallback| fallback.prefix.is_empty())
+            .any(|fallback| fallback.prefix == prefix)
         {
-            panic!("an application can contain only one fallback");
+            panic!("duplicate fallback for `{prefix}`");
         }
 
         self.fallbacks.push(RegisteredFallback {
-            prefix: String::new(),
+            prefix: prefix.to_owned(),
             handler: Box::new(HandlerAdapter::<H, Arguments, Input>::new(handler)),
         });
     }
 
-    pub(crate) fn nest(&mut self, prefix: &str, router: Router) {
-        validate_nest_prefix(prefix)
-            .unwrap_or_else(|error| panic!("invalid nest prefix `{prefix}`: {error}"));
-
-        for mut route in router.routes {
-            let source = join_paths(prefix, &route.path.source);
-            route.path = RoutePath::parse(&source)
-                .unwrap_or_else(|error| panic!("invalid nested route `{source}`: {error}"));
-
+    pub(crate) fn merge(&mut self, dispatcher: Dispatcher) {
+        for route in dispatcher.routes {
             if self.routes.iter().any(|existing| {
                 existing.method == route.method && existing.path.conflicts_with(&route.path)
             }) {
@@ -326,25 +392,45 @@ impl Router {
             self.routes.push(route);
         }
 
-        for fallback in router.fallbacks {
-            let nested_prefix = join_prefixes(prefix, &fallback.prefix);
-
+        for fallback in dispatcher.fallbacks {
             if self
                 .fallbacks
                 .iter()
-                .any(|existing| existing.prefix == nested_prefix)
+                .any(|existing| existing.prefix == fallback.prefix)
             {
-                panic!("duplicate fallback for `{nested_prefix}`");
+                panic!("duplicate fallback for `{}`", fallback.prefix);
             }
 
-            self.fallbacks.push(RegisteredFallback {
-                prefix: nested_prefix,
-                handler: fallback.handler,
-            });
+            self.fallbacks.push(fallback);
+        }
+
+        self.scopes.extend(dispatcher.scopes);
+    }
+
+    pub(crate) fn prepend(&mut self, prefix: &str) {
+        validate_scope_prefix(prefix)
+            .unwrap_or_else(|error| panic!("invalid Router prefix `{prefix}`: {error}"));
+
+        for route in &mut self.routes {
+            let source = join_paths(prefix, &route.path.source);
+            route.path = RoutePath::parse(&source)
+                .unwrap_or_else(|error| panic!("invalid scoped route `{source}`: {error}"));
+        }
+
+        for fallback in &mut self.fallbacks {
+            fallback.prefix = join_prefixes(prefix, &fallback.prefix);
+        }
+
+        for scope in &mut self.scopes {
+            scope.prepend(prefix);
         }
     }
 
-    pub(crate) async fn handle(&self, mut request: Request) -> Response {
+    pub(crate) fn add_scope(&mut self, scope: Scope) {
+        self.scopes.push(scope);
+    }
+
+    pub(crate) fn resolve(&self, request: &Request) -> Dispatch<'_> {
         let mut matched = Vec::new();
         let mut best_path: Option<&RoutePath> = None;
 
@@ -367,10 +453,10 @@ impl Router {
 
         if matched.is_empty() {
             if let Some(fallback) = self.fallback(request.path()) {
-                return fallback.handler.call(request).await;
+                return Dispatch::Fallback(fallback);
             }
 
-            return Response::text(404, "Not Found");
+            return Dispatch::NotFound;
         }
 
         let allow = allow_header(&matched);
@@ -380,15 +466,15 @@ impl Router {
         if requested == "OPTIONS" {
             if let Some(index) = route_index(&matched, "OPTIONS") {
                 let (route, captures) = matched.swap_remove(index);
-                request.set_params(captures);
-                let mut response = route.handler.call(request).await;
-                response.set_header("Allow", allow);
-                return response;
+                return Dispatch::Route {
+                    route,
+                    captures,
+                    head: false,
+                    allow: Some(allow),
+                };
             }
 
-            let mut response = Response::empty();
-            response.set_header("Allow", allow);
-            return response;
+            return Dispatch::Options { allow };
         }
 
         let selected = if is_head {
@@ -398,21 +484,27 @@ impl Router {
         };
 
         let Some(index) = selected else {
-            let mut response = Response::text(405, "Method Not Allowed");
-            response.set_header("Allow", allow);
-            return response;
+            return Dispatch::MethodNotAllowed { allow };
         };
 
         let (route, captures) = matched.swap_remove(index);
 
-        request.set_params(captures);
-        let response = route.handler.call(request).await;
-
-        if is_head {
-            response.without_body()
-        } else {
-            response
+        Dispatch::Route {
+            route,
+            captures,
+            head: is_head,
+            allow: None,
         }
+    }
+
+    pub(crate) fn matching_scopes(&self, path: &str) -> Vec<&Scope> {
+        let mut scopes = self
+            .scopes
+            .iter()
+            .filter(|scope| prefix_matches(&scope.prefix, path))
+            .collect::<Vec<_>>();
+        scopes.sort_by_key(|scope| scope.prefix.len());
+        scopes
     }
 
     fn fallback(&self, path: &str) -> Option<&RegisteredFallback> {
@@ -464,6 +556,79 @@ impl Router {
     }
 }
 
+pub(crate) enum Dispatch<'dispatcher> {
+    Route {
+        route: &'dispatcher RegisteredRoute,
+        captures: Vec<(String, String)>,
+        head: bool,
+        allow: Option<String>,
+    },
+    Fallback(&'dispatcher RegisteredFallback),
+    NotFound,
+    MethodNotAllowed {
+        allow: String,
+    },
+    Options {
+        allow: String,
+    },
+}
+
+impl Dispatch<'_> {
+    pub(crate) fn excluded_middlewares(&self) -> &[TypeId] {
+        match self {
+            Self::Route { route, .. } => &route.excluded_middlewares,
+            _ => &[],
+        }
+    }
+
+    pub(crate) fn route_middlewares(&self) -> &[MiddlewareEntry] {
+        match self {
+            Self::Route { route, .. } => &route.middlewares,
+            _ => &[],
+        }
+    }
+}
+
+impl MiddlewareTerminal for Dispatch<'_> {
+    fn call(&self, mut request: Request) -> MiddlewareFuture<'_> {
+        Box::pin(async move {
+            match self {
+                Self::Route {
+                    route,
+                    captures,
+                    head,
+                    allow,
+                } => {
+                    request.set_params(captures.clone());
+                    let mut response = route.handler.call(request).await;
+
+                    if let Some(allow) = allow {
+                        response.set_header("Allow", allow.clone());
+                    }
+
+                    if *head {
+                        response.without_body()
+                    } else {
+                        response
+                    }
+                }
+                Self::Fallback(fallback) => fallback.handler.call(request).await,
+                Self::NotFound => Response::text(404, "Not Found"),
+                Self::MethodNotAllowed { allow } => {
+                    let mut response = Response::text(405, "Method Not Allowed");
+                    response.set_header("Allow", allow.clone());
+                    response
+                }
+                Self::Options { allow } => {
+                    let mut response = Response::empty();
+                    response.set_header("Allow", allow.clone());
+                    response
+                }
+            }
+        })
+    }
+}
+
 fn route_index(
     routes: &[(&RegisteredRoute, Vec<(String, String)>)],
     method: &str,
@@ -487,8 +652,8 @@ fn allow_header(routes: &[(&RegisteredRoute, Vec<(String, String)>)]) -> String 
         .join(", ")
 }
 
-fn validate_nest_prefix(prefix: &str) -> Result<(), String> {
-    if prefix == "/" {
+pub(crate) fn validate_scope_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.is_empty() || prefix == "/" {
         return Ok(());
     }
 
@@ -499,13 +664,13 @@ fn validate_nest_prefix(prefix: &str) -> Result<(), String> {
         .iter()
         .any(|segment| !matches!(segment, RouteSegment::Static(_)))
     {
-        return Err("nest prefixes must contain only static segments".to_owned());
+        return Err("Router prefixes must contain only static segments".to_owned());
     }
 
     Ok(())
 }
 
-fn join_paths(prefix: &str, path: &str) -> String {
+pub(crate) fn join_paths(prefix: &str, path: &str) -> String {
     if prefix == "/" || prefix.is_empty() {
         path.to_owned()
     } else if path == "/" {
@@ -515,7 +680,7 @@ fn join_paths(prefix: &str, path: &str) -> String {
     }
 }
 
-fn join_prefixes(prefix: &str, nested: &str) -> String {
+pub(crate) fn join_prefixes(prefix: &str, nested: &str) -> String {
     match (prefix, nested) {
         ("/", "") => String::new(),
         (_, "") => prefix.to_owned(),
@@ -539,8 +704,8 @@ mod tests {
     };
 
     use crate::{
-        App, ExtraFields, Header, Headers, Method, Path, Query, Request, RequestStream,
-        RouteMethods, StreamError,
+        Config, ExtraFields, Header, Headers, Method, Path, Query, Request, RequestStream,
+        RouteMethods, Router, StreamError,
     };
 
     #[derive(crate::Schema)]
@@ -642,6 +807,10 @@ mod tests {
         "fallback"
     }
 
+    async fn nested_fallback() -> &'static str {
+        "nested-fallback"
+    }
+
     async fn search(Query(query): Query<SearchQuery>) -> String {
         query.q
     }
@@ -735,7 +904,7 @@ mod tests {
 
     #[test]
     fn dispatches_a_matching_route() {
-        let application = App::new(("/health".GET(health),));
+        let application = Router::new(Config::new(), ("/health".GET(health),));
         let response = block_on(application.handle(request("/health")));
 
         assert_eq!(response.status(), 200);
@@ -744,7 +913,7 @@ mod tests {
 
     #[test]
     fn returns_not_found_for_an_unknown_route() {
-        let application = App::new(("/health".GET(health),));
+        let application = Router::new(Config::new(), ("/health".GET(health),));
         let response = block_on(application.handle(request("/missing")));
 
         assert_eq!(response.status(), 404);
@@ -753,10 +922,13 @@ mod tests {
 
     #[test]
     fn captures_parameters_at_any_segment() {
-        let application = App::new((
-            "/asdf/:id/asdd".GET(item),
-            "/:organization/users/:id".GET(user),
-        ));
+        let application = Router::new(
+            Config::new(),
+            (
+                "/asdf/:id/asdd".GET(item),
+                "/:organization/users/:id".GET(user),
+            ),
+        );
 
         let response = block_on(application.handle(request("/asdf/42/asdd")));
         assert_eq!(response.status(), 200);
@@ -769,7 +941,10 @@ mod tests {
 
     #[test]
     fn prefers_static_routes_over_parameter_routes() {
-        let application = App::new(("/items/:id".GET(item), "/items/new".GET(literal)));
+        let application = Router::new(
+            Config::new(),
+            ("/items/:id".GET(item), "/items/new".GET(literal)),
+        );
         let response = block_on(application.handle(request("/items/new")));
 
         assert_eq!(response.status(), 200);
@@ -778,7 +953,7 @@ mod tests {
 
     #[test]
     fn query_extractor_ignores_unknown_fields_by_default() {
-        let application = App::new(("/search".GET(search),));
+        let application = Router::new(Config::new(), ("/search".GET(search),));
         let response =
             block_on(application.handle(request_with("/search", Some("q=rust&debug=true"), [])));
 
@@ -788,7 +963,7 @@ mod tests {
 
     #[test]
     fn query_schema_can_reject_unknown_fields() {
-        let application = App::new(("/search".GET(strict_search),));
+        let application = Router::new(Config::new(), ("/search".GET(strict_search),));
         let response =
             block_on(application.handle(request_with("/search", Some("q=rust&debug=true"), [])));
 
@@ -798,13 +973,16 @@ mod tests {
 
     #[test]
     fn path_rejects_unknown_fields_by_default_and_can_ignore_them() {
-        let strict = App::new(("/:organization/items/:id".GET(item),));
+        let strict = Router::new(Config::new(), ("/:organization/items/:id".GET(item),));
         let response = block_on(strict.handle(request("/acme/items/42")));
 
         assert_eq!(response.status(), 400);
         assert!(String::from_utf8_lossy(response.body()).contains("organization"));
 
-        let flexible = App::new(("/:organization/items/:id".GET(flexible_item),));
+        let flexible = Router::new(
+            Config::new(),
+            ("/:organization/items/:id".GET(flexible_item),),
+        );
         let response = block_on(flexible.handle(request("/acme/items/42")));
 
         assert_eq!(response.status(), 200);
@@ -813,7 +991,7 @@ mod tests {
 
     #[test]
     fn query_schema_can_capture_unknown_fields() {
-        let application = App::new(("/search".GET(captured_query),));
+        let application = Router::new(Config::new(), ("/search".GET(captured_query),));
         let response = block_on(application.handle(request_with(
             "/search",
             Some("q=rust&debug=true&tag=web&tag=server"),
@@ -826,7 +1004,7 @@ mod tests {
 
     #[test]
     fn header_extractor_allows_unknown_fields() {
-        let application = App::new(("/authenticated".GET(authenticated),));
+        let application = Router::new(Config::new(), ("/authenticated".GET(authenticated),));
         let response = block_on(application.handle(request_with(
             "/authenticated",
             None,
@@ -839,7 +1017,10 @@ mod tests {
 
     #[test]
     fn header_schema_can_reject_unknown_fields() {
-        let application = App::new(("/authenticated".GET(strictly_authenticated),));
+        let application = Router::new(
+            Config::new(),
+            ("/authenticated".GET(strictly_authenticated),),
+        );
         let response = block_on(application.handle(request_with(
             "/authenticated",
             None,
@@ -852,13 +1033,16 @@ mod tests {
 
     #[test]
     fn dispatches_each_method_on_the_same_path() {
-        let application = App::new((
-            "/resource".GET(get_method),
-            "/resource".POST(post_method),
-            "/resource".PUT(put_method),
-            "/resource".PATCH(patch_method),
-            "/resource".DELETE(delete_method),
-        ));
+        let application = Router::new(
+            Config::new(),
+            (
+                "/resource".GET(get_method),
+                "/resource".POST(post_method),
+                "/resource".PUT(put_method),
+                "/resource".PATCH(patch_method),
+                "/resource".DELETE(delete_method),
+            ),
+        );
 
         for (method, expected) in [
             ("GET", b"get".as_slice()),
@@ -876,7 +1060,10 @@ mod tests {
 
     #[test]
     fn returns_method_not_allowed_with_allow_header() {
-        let application = App::new(("/resource".GET(get_method), "/resource".POST(post_method)));
+        let application = Router::new(
+            Config::new(),
+            ("/resource".GET(get_method), "/resource".POST(post_method)),
+        );
         let response = block_on(application.handle(request_with_method("DELETE", "/resource")));
         let (status, headers, body) = response.into_parts();
 
@@ -890,7 +1077,7 @@ mod tests {
 
     #[test]
     fn head_uses_get_without_returning_its_body() {
-        let application = App::new(("/resource".GET(get_method),));
+        let application = Router::new(Config::new(), ("/resource".GET(get_method),));
         let response = block_on(application.handle(request_with_method("HEAD", "/resource")));
         let (status, headers, body) = response.into_parts();
 
@@ -905,7 +1092,10 @@ mod tests {
 
     #[test]
     fn explicit_head_takes_precedence_over_get() {
-        let application = App::new(("/resource".GET(get_method), "/resource".HEAD(explicit_head)));
+        let application = Router::new(
+            Config::new(),
+            ("/resource".GET(get_method), "/resource".HEAD(explicit_head)),
+        );
         let response = block_on(application.handle(request_with_method("HEAD", "/resource")));
         let (status, headers, body) = response.into_parts();
 
@@ -916,7 +1106,10 @@ mod tests {
 
     #[test]
     fn options_is_generated_unless_an_explicit_route_exists() {
-        let generated = App::new(("/resource".GET(get_method), "/resource".PATCH(patch_method)));
+        let generated = Router::new(
+            Config::new(),
+            ("/resource".GET(get_method), "/resource".PATCH(patch_method)),
+        );
         let response = block_on(generated.handle(request_with_method("OPTIONS", "/resource")));
         let (status, headers, body) = response.into_parts();
 
@@ -927,7 +1120,7 @@ mod tests {
         );
         assert_eq!(body.buffered(), Some(b"".as_slice()));
 
-        let explicit = App::new(("/resource".OPTIONS(explicit_options),));
+        let explicit = Router::new(Config::new(), ("/resource".OPTIONS(explicit_options),));
         let response = block_on(explicit.handle(request_with_method("OPTIONS", "/resource")));
         let (status, headers, body) = response.into_parts();
 
@@ -938,7 +1131,10 @@ mod tests {
 
     #[test]
     fn method_matching_respects_static_route_precedence() {
-        let application = App::new(("/items/new".GET(get_method), "/items/:id".POST(post_method)));
+        let application = Router::new(
+            Config::new(),
+            ("/items/new".GET(get_method), "/items/:id".POST(post_method)),
+        );
         let response = block_on(application.handle(request_with_method("POST", "/items/new")));
         let (status, headers, _) = response.into_parts();
 
@@ -948,10 +1144,13 @@ mod tests {
 
     #[test]
     fn chooses_specificity_from_left_to_right() {
-        let application = App::new((
-            "/:section/settings".GET(health),
-            "/users/:page".GET(literal),
-        ));
+        let application = Router::new(
+            Config::new(),
+            (
+                "/:section/settings".GET(health),
+                "/users/:page".GET(literal),
+            ),
+        );
         let response = block_on(application.handle(request("/users/settings")));
 
         assert_eq!(response.body(), b"literal");
@@ -959,7 +1158,7 @@ mod tests {
 
     #[test]
     fn wildcard_captures_the_remaining_path() {
-        let application = App::new(("/assets/*path".GET(wildcard),));
+        let application = Router::new(Config::new(), ("/assets/*path".GET(wildcard),));
         let response = block_on(application.handle(request("/assets/css/app.css")));
 
         assert_eq!(response.body(), b"css/app.css");
@@ -967,11 +1166,14 @@ mod tests {
 
     #[test]
     fn static_and_parameter_routes_precede_wildcards() {
-        let application = App::new((
-            "/files/*path".GET(wildcard),
-            "/files/:path".GET(item),
-            "/files/new".GET(literal),
-        ));
+        let application = Router::new(
+            Config::new(),
+            (
+                "/files/*path".GET(wildcard),
+                "/files/:path".GET(item),
+                "/files/new".GET(literal),
+            ),
+        );
 
         let response = block_on(application.handle(request("/files/new")));
         assert_eq!(response.body(), b"literal");
@@ -979,7 +1181,7 @@ mod tests {
 
     #[test]
     fn route_adds_routes_without_a_tuple_limit() {
-        let application = App::new(())
+        let application = Router::new(Config::new(), ())
             .route("/one".GET(health))
             .route("/two".GET(literal));
 
@@ -990,19 +1192,23 @@ mod tests {
     }
 
     #[test]
-    fn nest_prefixes_an_application() {
-        let api = App::new(("/health".GET(health),));
-        let application = App::new(()).nest("/api", api);
+    fn routes_a_router_with_parent_mount_and_config_prefixes() {
+        let api = Router::new(Config::new().prefix("/v1"), ("/health".GET(health),)).at("/mounted");
+        let application = Router::new(Config::new().prefix("/parent"), ()).route(api);
 
         assert_eq!(
-            block_on(application.handle(request("/api/health"))).body(),
+            block_on(application.handle(request("/parent/mounted/v1/health"))).body(),
             b"ok",
+        );
+        assert_eq!(
+            block_on(application.handle(request("/parent/v1/mounted/health"))).status(),
+            404,
         );
     }
 
     #[test]
     fn fallback_handles_unmatched_paths() {
-        let application = App::new(("/health".GET(health),)).fallback(fallback);
+        let application = Router::new(Config::new(), ("/health".GET(health),)).fallback(fallback);
 
         assert_eq!(
             block_on(application.handle(request("/missing"))).body(),
@@ -1011,14 +1217,34 @@ mod tests {
     }
 
     #[test]
+    fn child_fallback_only_handles_paths_inside_its_prefix() {
+        let child = Router::new(Config::new().prefix("/api"), ()).fallback(nested_fallback);
+        let router = Router::new(Config::new(), ())
+            .fallback(fallback)
+            .route(child);
+
+        assert_eq!(
+            block_on(router.handle(request("/api/missing"))).body(),
+            b"nested-fallback",
+        );
+        assert_eq!(
+            block_on(router.handle(request("/missing"))).body(),
+            b"fallback",
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "conflicting GET route")]
     fn rejects_equivalent_parameter_routes() {
-        let _application = App::new(("/users/:id".GET(health), "/users/:name".GET(literal)));
+        let _application = Router::new(
+            Config::new(),
+            ("/users/:id".GET(health), "/users/:name".GET(literal)),
+        );
     }
 
     #[test]
     #[should_panic(expected = "wildcard must be the final")]
     fn rejects_non_terminal_wildcards() {
-        let _application = App::new(("/assets/*path/edit".GET(health),));
+        let _application = Router::new(Config::new(), ("/assets/*path/edit".GET(health),));
     }
 }

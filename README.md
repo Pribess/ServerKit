@@ -1,8 +1,8 @@
 # ServerKit
 
-ServerKit is a portable Rust HTTP application layer with an Ohkami-inspired
+ServerKit is a portable Rust HTTP router with an Ohkami-inspired
 routing API. Native HTTP/1 serving is available through `std::net::TcpListener`;
-Cloudflare Workers use the same `App`, routes, handlers, and extractors through
+Cloudflare Workers use the same `Router`, routes, handlers, and extractors through
 the built-in adapter.
 
 ## Installation
@@ -75,29 +75,29 @@ async fn get_user(
 }
 
 fn main() -> std::io::Result<()> {
-    let application = App::new((
+    let router = Router::new(Config::new(), (
         "/health".GET(health),
         "/:organization/users/:id".GET(get_user),
     ));
 
-    application.run(TcpListener::bind("127.0.0.1:3000")?)
+    router.run(TcpListener::bind("127.0.0.1:3000")?)
 }
 ```
 
-`App::new` accepts one route or a convenience tuple. `.route()` can then be
-called any number of times, so the number of routes in an application is not
+`Router::new` accepts one route or a convenience tuple. `.route()` can then be
+called any number of times, so the number of routes in a router is not
 bounded by tuple arity. Handler functions may have zero through sixteen
 extractor arguments. Metadata and buffered extractors may appear in any order.
 A streaming extractor such as `Body` or `Multipart`, when present, must be the
 final argument.
 
 ```rust
-use serverkit::{App, RouteMethods};
+use serverkit::{Config, Router, RouteMethods};
 
 async fn health() -> &'static str { "ok" }
 async fn metrics() -> &'static str { "metrics" }
 
-let application = App::new("/health".GET(health))
+let router = Router::new(Config::new(), "/health".GET(health))
     .route("/metrics".GET(metrics));
 ```
 
@@ -107,7 +107,7 @@ Routes support `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, and `OPTIONS`.
 The same path can register a different handler for each method.
 
 ```rust
-use serverkit::{App, RouteMethods};
+use serverkit::{Config, Router, RouteMethods};
 
 async fn read() -> &'static str {
     "read"
@@ -117,8 +117,8 @@ async fn create() -> &'static str {
     "created"
 }
 
-fn application() -> App {
-    App::new(("/items".GET(read), "/items".POST(create)))
+fn router() -> Router {
+    Router::new(Config::new(), ("/items".GET(read), "/items".POST(create)))
 }
 ```
 
@@ -146,8 +146,8 @@ async fn item(Path(path): Path<ItemPath>) -> String {
     path.id.to_string()
 }
 
-fn application() -> App {
-    App::new(("/asdf/:id/asdd".GET(item),))
+fn router() -> Router {
+    Router::new(Config::new(), ("/asdf/:id/asdd".GET(item),))
 }
 ```
 
@@ -160,8 +160,8 @@ async fn gpu(Path(id): Path<u64>) -> String {
     id.to_string()
 }
 
-fn application() -> App {
-    App::new(("/gpus/:id".GET(gpu),))
+fn router() -> Router {
+    Router::new(Config::new(), ("/gpus/:id".GET(gpu),))
 }
 ```
 
@@ -182,29 +182,100 @@ async fn asset(Path(path): Path<AssetPath>) -> String {
     path.path
 }
 
-let application = App::new("/assets/*path".GET(asset));
+let router = Router::new(Config::new(), "/assets/*path".GET(asset));
 ```
 
 Matching is deterministic from left to right: static segments precede
 parameters, and parameters precede wildcards. Equivalent patterns such as
-`/users/:id` and `/users/:name` for the same method are rejected when the app
+`/users/:id` and `/users/:name` for the same method are rejected when the router
 is built. Empty parameter names, duplicate parameter names, non-terminal
 wildcards, queries, fragments, duplicate slashes, and trailing slashes are
 also rejected.
 
-Applications can be nested under a static prefix and can define a fallback:
+`Config::prefix` gives a router its own static prefix. `.at()` adds a mount
+outside that prefix, and a child router is registered with the same `.route()`
+method used for individual routes:
 
 ```rust
-use serverkit::{App, RouteMethods};
+use serverkit::{Config, Router, RouteMethods};
 
 async fn users() -> &'static str { "users" }
 async fn missing() -> &'static str { "missing" }
 
-let api = App::new("/users".GET(users));
-let application = App::new(())
-    .nest("/api", api)
+let api = Router::new(
+    Config::new().prefix("/v1"),
+    "/users".GET(users),
+)
+.at("/service");
+
+let router = Router::new(Config::new().prefix("/root"), ())
+    .route(api)
     .fallback(missing);
 ```
+
+The resulting route is `/root/service/v1/users`. Prefixes always compose in
+this order: parent `Config::prefix`, child `.at()`, child `Config::prefix`, and
+the route path. Prefixes are static, start with `/`, and cannot end with `/`.
+`Config::new()` is required even when no options are set so router construction
+keeps one stable shape as configuration grows.
+
+## Middleware
+
+Middleware can be attached to a router scope or to one route. Parent router
+middleware wraps child router middleware, which wraps route middleware and the
+handler. The response unwinds in reverse order.
+
+```rust
+use serverkit::{
+    Config, Middleware, Next, Request, Response, RouteMethods, Router,
+};
+
+struct Trace;
+
+impl Middleware for Trace {
+    async fn handle(&self, request: Request, next: Next<'_>) -> Response {
+        let mut response = next.run(request).await;
+        response.headers().set("X-Trace", "complete").unwrap();
+        response
+    }
+}
+
+struct Authentication;
+
+impl Middleware for Authentication {
+    async fn handle(&self, request: Request, next: Next<'_>) -> Response {
+        if request.headers().contains("Authorization") {
+            next.run(request).await
+        } else {
+            Response::text(401, "Unauthorized")
+        }
+    }
+}
+
+async fn private() -> &'static str { "private" }
+async fn public() -> &'static str { "public" }
+
+let api = Router::new(
+    Config::new().prefix("/api"),
+    (
+        "/private".GET(private),
+        "/public"
+            .GET(public)
+            .without_middleware::<Authentication>(),
+    ),
+)
+.middleware(Authentication);
+
+let router = Router::new(Config::new(), ())
+    .middleware(Trace)
+    .route(api);
+```
+
+`Route::without_middleware::<M>()` skips inherited middleware with the exact
+concrete type `M` for that route. It does not remove middleware attached
+directly to the route. Scoped middleware also runs for a scoped fallback and
+for generated responses such as 404, 405, and automatic OPTIONS within that
+scope; route middleware only runs after a route is selected.
 
 ## Query extraction
 
@@ -229,8 +300,8 @@ async fn search(Query(search): Query<Search>) -> String {
     format!("{}:{}", search.term, search.page)
 }
 
-fn application() -> App {
-    App::new(("/search".GET(search),))
+fn router() -> Router {
+    Router::new(Config::new(), ("/search".GET(search),))
 }
 ```
 
@@ -258,8 +329,8 @@ async fn authenticated(Header(headers): Header<Authentication>) -> String {
     headers.authorization
 }
 
-fn application() -> App {
-    App::new(("/authenticated".GET(authenticated),))
+fn router() -> Router {
+    Router::new(Config::new(), ("/authenticated".GET(authenticated),))
 }
 ```
 
@@ -587,8 +658,8 @@ async fn upload(mut body: Body) -> Result<Vec<u8>, StreamError> {
     Ok(bytes)
 }
 
-fn application() -> App {
-    App::new(("/upload".GET(upload),))
+fn router() -> Router {
+    Router::new(Config::new(), ("/upload".GET(upload),))
 }
 ```
 
@@ -600,12 +671,12 @@ into a replay stream for `Body`. With no buffered extractor, `Body` receives the
 runtime's original stream without pre-reading it.
 
 ```compile_fail
-use serverkit::{App, Body, Method, RouteMethods};
+use serverkit::{Body, Config, Method, RouteMethods, Router};
 
 async fn invalid_order(_body: Body, _method: Method) {}
 
-fn application() -> App {
-    App::new(("/upload".GET(invalid_order),))
+fn router() -> Router {
+    Router::new(Config::new(), ("/upload".GET(invalid_order),))
 }
 ```
 
@@ -649,7 +720,7 @@ async fn create_user(Json(user): Json<CreateUser>) -> String {
 
 `Json<T>` requires `Content-Type: application/json` or a media type ending in
 `+json`. Unsupported media types return 415, malformed JSON returns 400, and
-the application body limit is checked before deserialization. Returning
+the router body limit is checked before deserialization. Returning
 `Json<T>` serializes a JSON response with the matching content type. `T` also
 implements `Schema`, allowing request and response types to be emitted into
 OpenAPI `components/schemas` and referenced with `$ref`.
@@ -688,14 +759,14 @@ async fn login(Form(login): Form<Login>) -> String {
 }
 ```
 
-Set a limit once on the application. Buffered extractors enforce it while
+Set a limit once on the router. Buffered extractors enforce it while
 collecting, and streaming extractors enforce it as chunks are read. With no
 configured limit, request bodies remain unlimited.
 
 ```rust
-use serverkit::App;
+use serverkit::{Config, Router};
 
-let application = App::new(()).body_limit(2 * 1024 * 1024);
+let router = Router::new(Config::new(), ()).body_limit(2 * 1024 * 1024);
 ```
 
 ## Multipart
@@ -725,11 +796,11 @@ Each `MultipartField` exposes `headers`, `name`, `file_name`, `content_type`,
 
 ## State, extensions, connection information, and cookies
 
-Application state is stored once and extracted as `State<T>`, which contains an
+Router state is stored once and extracted as `State<T>`, which contains an
 `Arc<T>`.
 
 ```rust
-use serverkit::{App, State};
+use serverkit::{Config, Router, State};
 
 struct Configuration {
     region: String,
@@ -739,7 +810,7 @@ async fn region(State(configuration): State<Configuration>) -> String {
     configuration.region.clone()
 }
 
-let application = App::new(()).state(Configuration {
+let router = Router::new(Config::new(), ()).state(Configuration {
     region: "ap-northeast-2".to_owned(),
 });
 ```
@@ -830,20 +901,20 @@ taking the same request stream.
 ## Cloudflare Workers
 
 Enable the `worker` feature. The adapter converts the host request before
-dispatch and converts ServerKit's buffered response afterward; the application
+dispatch and converts ServerKit's buffered response afterward; the router
 itself stays runtime-independent.
 
 ```rust,ignore
 use std::sync::LazyLock;
 
 use serverkit::{
-    App, RouteMethods,
+    Config, Router, RouteMethods,
     cloudflare::{self, WorkerContext},
 };
 use worker::{Context, Env, Request, Response, Result, event};
 
-static APP: LazyLock<App> = LazyLock::new(|| {
-    App::new(("/health".GET(health), "/colo".GET(colo)))
+static ROUTER: LazyLock<Router> = LazyLock::new(|| {
+    Router::new(Config::new(), ("/health".GET(health), "/colo".GET(colo)))
 });
 
 async fn health() -> &'static str {
@@ -859,7 +930,7 @@ async fn colo(context: WorkerContext) -> String {
 #[event(fetch)]
 async fn fetch(request: Request, env: Env, context: Context) -> Result<Response> {
     cloudflare::into_response(
-        APP.handle(cloudflare::from_request(request, env, context)?)
+        ROUTER.handle(cloudflare::from_request(request, env, context)?)
             .await,
     )
 }
@@ -1037,14 +1108,14 @@ and WebSocket handshake; the Workers adapter creates and accepts a
 
 ## OpenAPI
 
-`App::openapi` takes the serving path first, generates OpenAPI 3.1 from
+`Router::openapi` takes the serving path first, generates OpenAPI 3.1 from
 registered routes, extractors, Schemaval metadata, validation constraints,
 request media types, and response types, then serves a Scalar API Reference at
 that path.
 
 ```rust
 use serverkit::{
-    App, OpenApi, Path, RouteMethods, Scalar, ScalarDeveloperTools, Schema,
+    Config, Router, OpenApi, Path, RouteMethods, Scalar, ScalarDeveloperTools, Schema,
     SchemaKind, SchemaMetadata, SecurityRequirement, SecurityScheme, Server,
 };
 
@@ -1086,9 +1157,9 @@ let document = OpenApi::new("Items API", "1.0.0")
             .developer_tools(ScalarDeveloperTools::Localhost),
     );
 
-let application = App::new(route).openapi("/docs", document);
+let router = Router::new(Config::new(), route).openapi("/docs", document);
 
-assert!(application
+assert!(router
     .openapi_document()
     .unwrap()
     .as_str()
@@ -1097,10 +1168,10 @@ assert!(application
 
 The serving path must be static. The page loads the pinned Scalar browser
 bundle `@scalar/api-reference@1.63.0` from jsDelivr and embeds the OpenAPI document generated from the
-application's current routes and schemas directly into Scalar's `content`
+router's current routes and schemas directly into Scalar's `content`
 configuration. It does not read a file or fetch a separate document endpoint.
 The page supports GET, HEAD, and OPTIONS; other methods return 405 with an
-`Allow` header. `App::openapi_document` provides direct access to the generated
+`Allow` header. `Router::openapi_document` provides direct access to the generated
 JSON in memory.
 
 Named Schemaval types, including `Json<T>` request and response bodies, are
@@ -1125,28 +1196,28 @@ Pass an `ExampleValue` to `Operation::request_example` or
 
 ## Listener adapters
 
-`App::run` dispatches to the `Listener` implementation of the value passed by
+`Router::run` dispatches to the `Listener` implementation of the value passed by
 the user. `std::net::TcpListener` is implemented by ServerKit. Other runtimes
 can expose their own local wrapper type and implement the same trait.
 
 ```rust
-use serverkit::{App, Listener};
+use serverkit::{Config, Listener, Router};
 
 struct TestListener;
 
 impl Listener for TestListener {
-    type Output = (App, &'static str);
+    type Output = (Router, &'static str);
 
-    fn serve(self, application: App) -> Self::Output {
-        (application, "ready")
+    fn serve(self, router: Router) -> Self::Output {
+        (router, "ready")
     }
 }
 
-let application = App::new(());
-let (_application, state) = application.run(TestListener);
+let router = Router::new(Config::new(), ());
+let (_router, state) = router.run(TestListener);
 
 assert_eq!(state, "ready");
 ```
 
-The application-level routing and extraction layer remains independent of the
+The routing and extraction layer remains independent of the
 listener and request-stream adapter used by a native runtime or Worker host.

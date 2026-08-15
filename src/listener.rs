@@ -1,7 +1,7 @@
-use crate::App;
+use crate::Router;
 
 pub trait Listener {
     type Output;
 
-    fn serve(self, application: App) -> Self::Output;
+    fn serve(self, router: Router) -> Self::Output;
 }

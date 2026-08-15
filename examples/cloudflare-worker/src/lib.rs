@@ -1,15 +1,15 @@
 use std::sync::LazyLock;
 
 use serverkit::{
-    App, Response as ServerResponse, RouteMethods, WebSocketMessage, WebSocketUpgrade,
+    Config, Response as ServerResponse, RouteMethods, Router, WebSocketMessage, WebSocketUpgrade,
     cloudflare::{self, WorkerContext},
 };
 use worker::{Context, Env, Request, Response, Result, event};
 
-static APP: LazyLock<App> = LazyLock::new(application);
+static ROUTER: LazyLock<Router> = LazyLock::new(router);
 
-fn application() -> App {
-    App::new((
+fn router() -> Router {
+    Router::new(Config::new(), (
         "/health".GET(health),
         "/colo".GET(colo),
         "/ws".GET(websocket),
@@ -50,7 +50,7 @@ async fn websocket(upgrade: WebSocketUpgrade) -> ServerResponse {
 #[event(fetch)]
 async fn fetch(request: Request, env: Env, context: Context) -> Result<Response> {
     cloudflare::into_response(
-        APP.handle(cloudflare::from_request(request, env, context)?)
+        ROUTER.handle(cloudflare::from_request(request, env, context)?)
             .await,
     )
 }

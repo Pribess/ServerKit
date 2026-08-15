@@ -7,5 +7,5 @@ async fn health() -> &'static str {
 }
 
 fn main() -> std::io::Result<()> {
-    App::new(("/health".GET(health),)).run(TcpListener::bind("127.0.0.1:3000")?)
+    Router::new(Config::new(), ("/health".GET(health),)).run(TcpListener::bind("127.0.0.1:3000")?)
 }

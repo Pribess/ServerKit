@@ -12,6 +12,7 @@ mod cookie;
 mod extract;
 mod handler;
 mod listener;
+mod middleware;
 mod multipart;
 #[cfg(not(target_family = "wasm"))]
 mod native;
@@ -27,7 +28,7 @@ mod stream;
 #[cfg(feature = "websocket")]
 mod websocket;
 
-pub use app::App;
+pub use app::{Config, Router};
 
 pub use body::Body;
 
@@ -45,6 +46,8 @@ pub use extract::{Json, JsonError};
 pub use handler::Handler;
 
 pub use listener::Listener;
+
+pub use middleware::{Middleware, Next};
 
 pub use multipart::{Multipart, MultipartError, MultipartField};
 
@@ -73,7 +76,7 @@ pub use serverkit_macros::Schema;
 #[doc(hidden)]
 pub use route::Routes;
 
-pub(crate) use router::Router;
+pub(crate) use router::{Dispatch, Dispatcher, Scope};
 
 #[cfg(all(feature = "worker", target_arch = "wasm32"))]
 pub(crate) use stream::EmptyRequestStream;
@@ -86,13 +89,14 @@ pub use websocket::{
 
 pub mod prelude {
     pub use crate::{
-        ApiKeyLocation, App, Body, DecodeOptions, ExampleValue, ExtraFields, FromRequest, Handler,
-        Header, HeaderError, Headers, IntoResponse, Listener, Method, OAuthFlow, OAuthFlows,
-        OpenApi, OpenApiDocument, Operation, ParameterLocation, Path, PathError, Query, QueryError,
-        Request, RequestStream, Response, ResponseBody, ResponseStream, Route, RouteMethods,
-        Scalar, ScalarDeveloperTools, Schema, SchemaField, SchemaKind, SchemaMetadata,
-        SecurityRequirement, SecurityScheme, Server, StreamError, UnknownFields, ValidationErrors,
-        ValidationIssue, ValidationRule, Value, ValueSchema, Values,
+        ApiKeyLocation, Body, Config, DecodeOptions, ExampleValue, ExtraFields, FromRequest,
+        Handler, Header, HeaderError, Headers, IntoResponse, Listener, Method, Middleware, Next,
+        OAuthFlow, OAuthFlows, OpenApi, OpenApiDocument, Operation, ParameterLocation, Path,
+        PathError, Query, QueryError, Request, RequestStream, Response, ResponseBody,
+        ResponseStream, Route, RouteMethods, Router, Scalar, ScalarDeveloperTools, Schema,
+        SchemaField, SchemaKind, SchemaMetadata, SecurityRequirement, SecurityScheme, Server,
+        StreamError, UnknownFields, ValidationErrors, ValidationIssue, ValidationRule, Value,
+        ValueSchema, Values,
     };
 
     pub use crate::{

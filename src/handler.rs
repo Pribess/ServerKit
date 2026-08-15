@@ -190,8 +190,8 @@ mod tests {
     };
 
     use crate::{
-        App, Body, Bytes, Extension, FromRequest, Handler, Headers, Method, Request, RequestStream,
-        RouteMethods, State, StreamError,
+        Body, Bytes, Config, Extension, FromRequest, Handler, Headers, Method, Request,
+        RequestStream, RouteMethods, Router, State, StreamError,
     };
 
     struct ProbeStream {
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn streaming_only_does_not_preconsume_the_body() {
         let polls = Rc::new(Cell::new(0));
-        let application = App::new(("/".GET(leave_stream_unread),));
+        let application = Router::new(Config::new(), ("/".GET(leave_stream_unread),));
         let response = block_on(application.handle(request(b"stream", Rc::clone(&polls))));
 
         assert_eq!(response.body(), b"unread");
@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn buffered_extractors_share_one_collection_before_streaming() {
         let polls = Rc::new(Cell::new(0));
-        let application = App::new(("/".GET(buffered_then_stream),));
+        let application = Router::new(Config::new(), ("/".GET(buffered_then_stream),));
         let response = block_on(application.handle(request(b"replayed", Rc::clone(&polls))));
 
         assert_eq!(response.body(), b"replayed");
@@ -364,22 +364,23 @@ mod tests {
 
     #[test]
     fn body_limit_applies_to_buffered_and_streaming_extractors() {
-        let buffered = App::new(("/".GET(buffered_body),)).body_limit(3);
+        let buffered = Router::new(Config::new(), ("/".GET(buffered_body),)).body_limit(3);
         let response = block_on(buffered.handle(request(b"four", Rc::new(Cell::new(0)))));
         assert_eq!(response.status(), 413);
 
-        let streaming = App::new(("/".GET(streaming_body),)).body_limit(3);
+        let streaming = Router::new(Config::new(), ("/".GET(streaming_body),)).body_limit(3);
         let response = block_on(streaming.handle(request(b"four", Rc::new(Cell::new(0)))));
         assert_eq!(response.status(), 413);
     }
 
     #[test]
     fn extracts_application_state_and_request_extensions() {
-        let application = App::new(("/".GET(application_state),)).state("ready".to_owned());
+        let application =
+            Router::new(Config::new(), ("/".GET(application_state),)).state("ready".to_owned());
         let response = block_on(application.handle(request(b"", Rc::new(Cell::new(0)))));
         assert_eq!(response.body(), b"ready");
 
-        let application = App::new(("/".GET(request_extension),));
+        let application = Router::new(Config::new(), ("/".GET(request_extension),));
         let mut request = request(b"", Rc::new(Cell::new(0)));
         request.insert_extension(42_u64);
         let response = block_on(application.handle(request));

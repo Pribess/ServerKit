@@ -1,15 +1,31 @@
-use std::{
-    any::{Any, TypeId},
-    collections::HashMap,
-    sync::Arc,
+use std::{any::TypeId, collections::HashMap};
+
+use crate::{
+    Dispatch, Dispatcher, Handler, Listener, Middleware, OpenApi, OpenApiDocument, Request,
+    Response, Routes, Scope,
+    middleware::{MiddlewareEntry, MiddlewareTerminal, run as run_middleware},
+    router::{join_paths, validate_scope_prefix},
 };
 
-use crate::{Handler, Listener, OpenApi, OpenApiDocument, Request, Response, Router, Routes};
+#[derive(Debug, Clone, Default)]
+pub struct Config {
+    prefix: String,
+}
 
-pub struct App {
-    router: Router,
-    states: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
-    body_limit: Option<usize>,
+impl Config {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = prefix.into();
+        self
+    }
+}
+
+pub struct Router {
+    dispatcher: Dispatcher,
+    scope: Scope,
     openapi: Option<PublishedOpenApi>,
 }
 
@@ -20,22 +36,44 @@ struct PublishedOpenApi {
     scalar_page: String,
 }
 
-impl App {
-    pub fn new(routes: impl Routes) -> Self {
-        let mut application = Self {
-            router: Router::new(),
-            states: HashMap::new(),
-            body_limit: None,
+impl Router {
+    pub fn new(config: Config, routes: impl Routes) -> Self {
+        let prefix = normalize_prefix(config.prefix);
+        validate_scope_prefix(&prefix)
+            .unwrap_or_else(|error| panic!("invalid Router prefix `{prefix}`: {error}"));
+        let mut router = Self {
+            dispatcher: Dispatcher::new(),
+            scope: Scope::new(prefix),
             openapi: None,
         };
 
-        routes.apply(&mut application);
+        routes.apply(&mut router);
 
-        application
+        router
     }
 
-    pub(crate) fn router_mut(&mut self) -> &mut Router {
-        &mut self.router
+    pub(crate) fn register<
+        Arguments: 'static,
+        Input: 'static,
+        H: Handler<Arguments, Input> + Send + Sync + 'static,
+    >(
+        &mut self,
+        method: crate::Method,
+        path: &'static str,
+        handler: H,
+        operation: crate::Operation,
+        middlewares: Vec<MiddlewareEntry>,
+        excluded_middlewares: Vec<TypeId>,
+    ) {
+        let path = join_paths(self.scope.prefix(), path);
+        self.dispatcher.register(
+            method,
+            path,
+            handler,
+            operation,
+            middlewares,
+            excluded_middlewares,
+        );
     }
 
     pub fn route(mut self, routes: impl Routes) -> Self {
@@ -44,33 +82,61 @@ impl App {
         self
     }
 
-    pub fn nest(mut self, prefix: &str, application: App) -> Self {
-        self.router.nest(prefix, application.router);
+    pub fn at(mut self, prefix: impl Into<String>) -> Self {
+        let prefix = normalize_prefix(prefix.into());
+        validate_scope_prefix(&prefix)
+            .unwrap_or_else(|error| panic!("invalid Router mount `{prefix}`: {error}"));
+
+        if prefix.is_empty() {
+            return self;
+        }
+
+        self.dispatcher.prepend(&prefix);
+        self.scope.prepend(&prefix);
+        if let Some(published) = &mut self.openapi {
+            published.path = join_paths(&prefix, &published.path);
+        }
         self.refresh_openapi();
         self
+    }
+
+    pub(crate) fn register_router(&mut self, mut router: Router) {
+        let parent_prefix = self.scope.prefix().to_owned();
+        if !parent_prefix.is_empty() {
+            router = router.at(parent_prefix);
+        }
+
+        self.dispatcher.add_scope(router.scope);
+        self.dispatcher.merge(router.dispatcher);
     }
 
     pub fn fallback<Arguments: 'static, Input: 'static>(
         mut self,
         handler: impl Handler<Arguments, Input> + Send + Sync + 'static,
     ) -> Self {
-        self.router.set_fallback(handler);
+        self.dispatcher.set_fallback(self.scope.prefix(), handler);
         self.refresh_openapi();
         self
     }
 
     pub fn state<T: Send + Sync + 'static>(mut self, state: T) -> Self {
-        self.states.insert(TypeId::of::<T>(), Arc::new(state));
+        self.scope.state(state);
         self
     }
 
     pub fn body_limit(mut self, limit: usize) -> Self {
-        self.body_limit = Some(limit);
+        self.scope.body_limit(limit);
+        self
+    }
+
+    pub fn middleware<M: Middleware>(mut self, middleware: M) -> Self {
+        self.scope.middleware(MiddlewareEntry::new(middleware));
         self
     }
 
     pub fn openapi(mut self, path: impl Into<String>, configuration: OpenApi) -> Self {
-        self.publish_openapi(path.into(), configuration);
+        let path = join_paths(self.scope.prefix(), &path.into());
+        self.publish_openapi(path, configuration);
         self
     }
 
@@ -83,17 +149,46 @@ impl App {
     }
 
     pub async fn handle(&self, mut request: Request) -> Response {
-        if let Some(response) = self.handle_openapi(&request) {
-            return response;
+        let terminal = match self.openapi.as_ref() {
+            Some(published) if request.path() == published.path => {
+                RouterTerminal::OpenApi(published)
+            }
+            _ => RouterTerminal::Dispatch(self.dispatcher.resolve(&request)),
+        };
+        let exclusions = terminal.excluded_middlewares();
+        let mut states = HashMap::new();
+        let mut body_limit = None;
+        let mut middlewares = Vec::new();
+
+        if self.scope.matches(request.path()) {
+            apply_scope(
+                &self.scope,
+                exclusions,
+                &mut states,
+                &mut body_limit,
+                &mut middlewares,
+            );
         }
 
-        request.set_states(self.states.clone());
-        request.set_body_limit(self.body_limit);
-        self.router.handle(request).await
+        for scope in self.dispatcher.matching_scopes(request.path()) {
+            apply_scope(
+                scope,
+                exclusions,
+                &mut states,
+                &mut body_limit,
+                &mut middlewares,
+            );
+        }
+
+        middlewares.extend(terminal.route_middlewares());
+        request.set_states(states);
+        request.set_body_limit(body_limit);
+
+        run_middleware(&middlewares, &terminal, request).await
     }
 
     fn publish_openapi(&mut self, path: String, configuration: OpenApi) {
-        self.router.validate_openapi_path(&path);
+        self.dispatcher.validate_openapi_path(&path);
         let document = self.build_openapi(&configuration);
         let scalar_page = configuration.scalar_page(&document);
         self.openapi = Some(PublishedOpenApi {
@@ -117,27 +212,80 @@ impl App {
     }
 
     fn build_openapi(&self, configuration: &OpenApi) -> OpenApiDocument {
-        configuration.build(self.router.openapi_routes())
+        configuration.build(self.dispatcher.openapi_routes())
+    }
+}
+
+fn normalize_prefix(prefix: String) -> String {
+    if prefix == "/" { String::new() } else { prefix }
+}
+
+fn apply_scope<'scope>(
+    scope: &'scope Scope,
+    exclusions: &[TypeId],
+    states: &mut HashMap<TypeId, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    body_limit: &mut Option<usize>,
+    middlewares: &mut Vec<&'scope MiddlewareEntry>,
+) {
+    states.extend(
+        scope
+            .states()
+            .iter()
+            .map(|(type_id, state)| (*type_id, state.clone())),
+    );
+    if let Some(limit) = scope.configured_body_limit() {
+        *body_limit = Some(limit);
+    }
+    middlewares.extend(
+        scope
+            .middlewares()
+            .iter()
+            .filter(|middleware| !exclusions.contains(&middleware.type_id())),
+    );
+}
+
+enum RouterTerminal<'router> {
+    OpenApi(&'router PublishedOpenApi),
+    Dispatch(Dispatch<'router>),
+}
+
+impl RouterTerminal<'_> {
+    fn excluded_middlewares(&self) -> &[TypeId] {
+        match self {
+            Self::OpenApi(_) => &[],
+            Self::Dispatch(dispatch) => dispatch.excluded_middlewares(),
+        }
     }
 
-    fn handle_openapi(&self, request: &Request) -> Option<Response> {
-        let published = self.openapi.as_ref()?;
-
-        if request.path() != published.path {
-            return None;
+    fn route_middlewares(&self) -> &[MiddlewareEntry] {
+        match self {
+            Self::OpenApi(_) => &[],
+            Self::Dispatch(dispatch) => dispatch.route_middlewares(),
         }
+    }
+}
 
-        let mut response = Response::bytes(200, published.scalar_page.as_bytes().to_vec());
-        response.set_header("Content-Type", "text/html; charset=utf-8");
+impl MiddlewareTerminal for RouterTerminal<'_> {
+    fn call(&self, request: Request) -> crate::middleware::MiddlewareFuture<'_> {
+        Box::pin(async move {
+            match self {
+                Self::OpenApi(published) => {
+                    let mut response =
+                        Response::bytes(200, published.scalar_page.as_bytes().to_vec());
+                    response.set_header("Content-Type", "text/html; charset=utf-8");
 
-        let mut response = match request.method().as_str() {
-            "GET" => response,
-            "HEAD" => response.without_body(),
-            "OPTIONS" => Response::empty(),
-            _ => Response::text(405, "Method Not Allowed"),
-        };
-        response.set_header("Allow", "GET, HEAD, OPTIONS");
-        Some(response)
+                    let mut response = match request.method().as_str() {
+                        "GET" => response,
+                        "HEAD" => response.without_body(),
+                        "OPTIONS" => Response::empty(),
+                        _ => Response::text(405, "Method Not Allowed"),
+                    };
+                    response.set_header("Allow", "GET, HEAD, OPTIONS");
+                    response
+                }
+                Self::Dispatch(dispatch) => dispatch.call(request).await,
+            }
+        })
     }
 }
 
@@ -149,8 +297,8 @@ mod tests {
     };
 
     use crate::{
-        App, Form, Headers, Method, OpenApi, Path, Query, Request, RequestStream, RouteMethods,
-        StreamError,
+        Config, Form, Headers, Method, OpenApi, Path, Query, Request, RequestStream, RouteMethods,
+        Router, StreamError,
     };
 
     #[derive(crate::Schema)]
@@ -225,23 +373,26 @@ mod tests {
 
     #[test]
     fn publishes_route_and_schema_metadata() {
-        let application = App::new((
-            "/items/:id"
-                .GET(item)
-                .summary("Read an item")
-                .description("Reads one item by ID")
-                .tag("items")
-                .operation_id("readItem")
-                .openapi(|operation| {
-                    operation.response_header(
-                        200,
-                        "X-Request-Id",
-                        "Request identifier",
-                        crate::SchemaMetadata::new(crate::SchemaKind::String).format("uuid"),
-                    );
-                }),
-            "/items".POST(create),
-        ))
+        let application = Router::new(
+            Config::new(),
+            (
+                "/items/:id"
+                    .GET(item)
+                    .summary("Read an item")
+                    .description("Reads one item by ID")
+                    .tag("items")
+                    .operation_id("readItem")
+                    .openapi(|operation| {
+                        operation.response_header(
+                            200,
+                            "X-Request-Id",
+                            "Request identifier",
+                            crate::SchemaMetadata::new(crate::SchemaKind::String).format("uuid"),
+                        );
+                    }),
+                "/items".POST(create),
+            ),
+        )
         .openapi("/docs", OpenApi::new("Items", "1.0"));
         let document = application.openapi_document().unwrap().as_str();
 
@@ -260,7 +411,8 @@ mod tests {
 
     #[test]
     fn serves_the_openapi_reference_with_head_and_method_handling() {
-        let application = App::new(()).openapi("/docs", OpenApi::new("Empty", "1.0"));
+        let application =
+            Router::new(Config::new(), ()).openapi("/docs", OpenApi::new("Empty", "1.0"));
         let response = block_on(application.handle(request("GET", "/docs")));
 
         assert_eq!(response.status(), 200);
@@ -281,7 +433,7 @@ mod tests {
 
     #[test]
     fn serves_a_scalar_reference_for_the_openapi_document() {
-        let application = App::new("/items/:id".GET(item))
+        let application = Router::new(Config::new(), "/items/:id".GET(item))
             .openapi("/reference", OpenApi::new("Items & API", "1.0"));
         let response = block_on(application.handle(request("GET", "/reference")));
         let body = std::str::from_utf8(response.body()).unwrap();
@@ -296,11 +448,29 @@ mod tests {
         assert!(body.contains("https://cdn.jsdelivr.net/npm/@scalar/api-reference"));
     }
 
+    #[test]
+    fn scopes_openapi_routes_and_reference_with_config_and_mount_prefixes() {
+        let router = Router::new(Config::new().prefix("/v1"), "/items/:id".GET(item))
+            .openapi("/docs", OpenApi::new("Items", "1.0"))
+            .at("/service");
+        let document = router.openapi_document().unwrap().as_str();
+
+        assert!(document.contains("\"/service/v1/items/{id}\""));
+        assert_eq!(
+            block_on(router.handle(request("GET", "/service/v1/docs"))).status(),
+            200,
+        );
+        assert_eq!(
+            block_on(router.handle(request("GET", "/v1/service/docs"))).status(),
+            404,
+        );
+    }
+
     #[cfg(feature = "json")]
     #[test]
     fn derives_json_request_and_response_components_from_schema() {
-        let application =
-            App::new("/items".POST(create_json)).openapi("/docs", OpenApi::new("Items", "1.0"));
+        let application = Router::new(Config::new(), "/items".POST(create_json))
+            .openapi("/docs", OpenApi::new("Items", "1.0"));
         let document = application.openapi_document().unwrap().as_str();
 
         assert!(document.contains("\"application/json\":{\"schema\":{\"$ref\":"));
