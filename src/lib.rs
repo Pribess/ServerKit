@@ -6,16 +6,12 @@ extern crate self as serverkit;
 
 mod app;
 mod body;
-#[cfg(all(feature = "worker", target_arch = "wasm32"))]
-pub mod cloudflare;
 mod cookie;
 mod extract;
 mod handler;
 mod listener;
 mod middleware;
 mod multipart;
-#[cfg(not(target_family = "wasm"))]
-mod native;
 pub mod openapi;
 mod redirect;
 mod request;
@@ -78,14 +74,18 @@ pub use route::Routes;
 
 pub(crate) use router::{Dispatch, Dispatcher, Scope};
 
-#[cfg(all(feature = "worker", target_arch = "wasm32"))]
-pub(crate) use stream::EmptyRequestStream;
 pub use stream::{RequestStream, ResponseStream, StreamError};
 
 #[cfg(feature = "websocket")]
 pub use websocket::{
     WebSocket, WebSocketError, WebSocketMessage, WebSocketUpgrade, WebSocketUpgradeError,
 };
+
+#[doc(hidden)]
+pub mod adapter {
+    #[cfg(feature = "websocket")]
+    pub use crate::websocket::{WebSocketIo, WebSocketPlan};
+}
 
 pub mod prelude {
     pub use crate::{

@@ -195,7 +195,8 @@ mod tests {
     };
 
     struct ProbeStream {
-        body: Option<Vec<u8>>,
+        body: Vec<u8>,
+        sent: bool,
         polls: Rc<Cell<usize>>,
     }
 
@@ -203,9 +204,19 @@ mod tests {
         fn poll_next(
             &mut self,
             _context: &mut Context<'_>,
-        ) -> Poll<Option<Result<Vec<u8>, StreamError>>> {
+        ) -> Poll<Option<Result<(), StreamError>>> {
             self.polls.set(self.polls.get() + 1);
-            Poll::Ready(self.body.take().map(Ok))
+
+            if self.sent {
+                Poll::Ready(None)
+            } else {
+                self.sent = true;
+                Poll::Ready(Some(Ok(())))
+            }
+        }
+
+        fn chunk(&self) -> &[u8] {
+            &self.body
         }
     }
 
@@ -237,13 +248,14 @@ mod tests {
     }
 
     fn request(body: &[u8], polls: Rc<Cell<usize>>) -> Request {
-        Request::new(
+        Request::from_parts(
             Method::new("GET"),
             "/",
             None,
             Headers::new(),
             Box::new(ProbeStream {
-                body: Some(body.to_vec()),
+                body: body.to_vec(),
+                sent: false,
                 polls,
             }),
         )
@@ -265,7 +277,7 @@ mod tests {
         mut body: Body,
     ) -> Vec<u8> {
         assert_eq!(first.0, second.0);
-        body.next().await.unwrap().unwrap()
+        body.next().await.unwrap().unwrap().to_vec()
     }
 
     async fn buffered_body(Bytes(bytes): Bytes) -> Vec<u8> {
@@ -276,7 +288,7 @@ mod tests {
         let mut bytes = Vec::new();
 
         while let Some(chunk) = body.next().await {
-            bytes.extend(chunk?);
+            bytes.extend_from_slice(chunk?);
         }
 
         Ok(bytes)

@@ -6,10 +6,14 @@ use std::{
 use crate::{IntoResponse, Response};
 
 pub trait RequestStream {
-    fn poll_next(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, StreamError>>>;
+    /// Advances to the next chunk without transferring its allocation.
+    ///
+    /// After returning `Poll::Ready(Some(Ok(())))`, `chunk` must expose the
+    /// new chunk until the next mutable call to this stream.
+    fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Result<(), StreamError>>>;
+
+    /// Borrows the chunk produced by the latest successful `poll_next` call.
+    fn chunk(&self) -> &[u8];
 }
 
 pub trait ResponseStream {
@@ -65,8 +69,9 @@ pub(crate) async fn collect_stream(
 ) -> Result<Vec<u8>, StreamError> {
     let mut buffered = Vec::new();
 
-    while let Some(chunk) = std::future::poll_fn(|context| stream.poll_next(context)).await {
-        let chunk = chunk?;
+    while let Some(result) = std::future::poll_fn(|context| stream.poll_next(context)).await {
+        result?;
+        let chunk = stream.chunk();
 
         if let Some(limit) = limit
             && buffered.len().saturating_add(chunk.len()) > limit
@@ -74,7 +79,7 @@ pub(crate) async fn collect_stream(
             return Err(StreamError::payload_too_large(limit));
         }
 
-        buffered.extend_from_slice(&chunk);
+        buffered.extend_from_slice(chunk);
     }
 
     Ok(buffered)
@@ -99,23 +104,20 @@ impl LimitedRequestStream {
 }
 
 impl RequestStream for LimitedRequestStream {
-    fn poll_next(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, StreamError>>> {
+    fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Result<(), StreamError>>> {
         if self.exhausted {
             return Poll::Ready(None);
         }
 
         match self.stream.poll_next(context) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                self.read = self.read.saturating_add(chunk.len());
+            Poll::Ready(Some(Ok(()))) => {
+                self.read = self.read.saturating_add(self.stream.chunk().len());
 
                 if self.read > self.limit {
                     self.exhausted = true;
                     Poll::Ready(Some(Err(StreamError::payload_too_large(self.limit))))
                 } else {
-                    Poll::Ready(Some(Ok(chunk)))
+                    Poll::Ready(Some(Ok(())))
                 }
             }
             Poll::Ready(Some(Err(error))) => {
@@ -129,40 +131,37 @@ impl RequestStream for LimitedRequestStream {
             Poll::Pending => Poll::Pending,
         }
     }
+
+    fn chunk(&self) -> &[u8] {
+        self.stream.chunk()
+    }
 }
 
 pub(crate) struct BufferedRequestStream {
     buffered: Vec<u8>,
+    consumed: bool,
 }
 
 impl BufferedRequestStream {
     pub(crate) fn new(buffered: Vec<u8>) -> Self {
-        Self { buffered }
+        Self {
+            buffered,
+            consumed: false,
+        }
     }
 }
 
 impl RequestStream for BufferedRequestStream {
-    fn poll_next(
-        &mut self,
-        _context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, StreamError>>> {
-        if self.buffered.is_empty() {
+    fn poll_next(&mut self, _context: &mut Context<'_>) -> Poll<Option<Result<(), StreamError>>> {
+        if self.consumed || self.buffered.is_empty() {
             return Poll::Ready(None);
         }
 
-        Poll::Ready(Some(Ok(std::mem::take(&mut self.buffered))))
+        self.consumed = true;
+        Poll::Ready(Some(Ok(())))
     }
-}
 
-#[cfg(all(feature = "worker", target_arch = "wasm32"))]
-pub(crate) struct EmptyRequestStream;
-
-#[cfg(all(feature = "worker", target_arch = "wasm32"))]
-impl RequestStream for EmptyRequestStream {
-    fn poll_next(
-        &mut self,
-        _context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, StreamError>>> {
-        Poll::Ready(None)
+    fn chunk(&self) -> &[u8] {
+        &self.buffered
     }
 }

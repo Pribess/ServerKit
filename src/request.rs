@@ -11,7 +11,7 @@ use crate::{IntoResponse, RequestStream, Response};
 pub struct Method(String);
 
 impl Method {
-    pub(crate) fn new(value: impl Into<String>) -> Self {
+    pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
@@ -188,7 +188,7 @@ pub struct Request {
 }
 
 impl Request {
-    pub(crate) fn new(
+    pub fn from_parts(
         method: Method,
         path: impl Into<String>,
         query: Option<String>,

@@ -5,9 +5,6 @@ use std::{
     task::{Context, Poll},
 };
 
-#[cfg(not(target_family = "wasm"))]
-use std::{cell::RefCell, rc::Rc};
-
 use crate::{FromRequest, IntoResponse, Request, Response, openapi::Operation};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +52,8 @@ pub struct WebSocket {
 }
 
 impl WebSocket {
-    pub(crate) fn new(inner: impl WebSocketIo + 'static) -> Self {
+    #[doc(hidden)]
+    pub fn from_io(inner: impl WebSocketIo + 'static) -> Self {
         Self {
             inner: Box::new(inner),
         }
@@ -93,7 +91,8 @@ impl WebSocket {
     }
 }
 
-pub(crate) trait WebSocketIo {
+#[doc(hidden)]
+pub trait WebSocketIo {
     fn poll_next(
         &mut self,
         context: &mut Context<'_>,
@@ -109,12 +108,9 @@ pub(crate) trait WebSocketIo {
 }
 
 pub struct WebSocketUpgrade {
-    #[cfg(not(target_family = "wasm"))]
     key: String,
     requested_protocols: Vec<String>,
     selected_protocol: Option<String>,
-    #[cfg(not(target_family = "wasm"))]
-    native: NativeUpgrade,
 }
 
 impl WebSocketUpgrade {
@@ -150,12 +146,9 @@ impl WebSocketUpgrade {
         });
         let selected_protocol = self.selected_protocol.clone();
         let plan = WebSocketPlan {
-            #[cfg(not(target_family = "wasm"))]
             key: self.key,
             selected_protocol,
             task,
-            #[cfg(not(target_family = "wasm"))]
-            native: self.native,
         };
 
         Response::websocket(plan)
@@ -168,7 +161,6 @@ pub enum WebSocketUpgradeError {
     Version,
     MissingKey,
     Protocol,
-    Runtime,
 }
 
 impl IntoResponse for WebSocketUpgradeError {
@@ -182,7 +174,6 @@ impl IntoResponse for WebSocketUpgradeError {
             }
             Self::MissingKey => Response::error(400, "WebSocket key is missing"),
             Self::Protocol => Response::error(400, "WebSocket protocol was not requested"),
-            Self::Runtime => Response::error(500, "WebSocket runtime upgrade is unavailable"),
         }
     }
 }
@@ -213,8 +204,6 @@ impl<'request> FromRequest<(&'request Request, &'request [u8])> for WebSocketUpg
             .filter(|key| !key.is_empty())
             .ok_or(WebSocketUpgradeError::MissingKey)?
             .to_owned();
-        #[cfg(target_family = "wasm")]
-        drop(key);
         let requested_protocols = header_text(headers.get("sec-websocket-protocol"))
             .into_iter()
             .flat_map(|protocols| protocols.split(','))
@@ -223,20 +212,10 @@ impl<'request> FromRequest<(&'request Request, &'request [u8])> for WebSocketUpg
             .map(str::to_owned)
             .collect();
 
-        #[cfg(not(target_family = "wasm"))]
-        let native = input
-            .0
-            .extension::<NativeUpgrade>()
-            .cloned()
-            .ok_or(WebSocketUpgradeError::Runtime)?;
-
         Ok(Self {
-            #[cfg(not(target_family = "wasm"))]
             key,
             requested_protocols,
             selected_protocol: None,
-            #[cfg(not(target_family = "wasm"))]
-            native,
         })
     }
 
@@ -256,42 +235,25 @@ type WebSocketTask = Box<dyn FnOnce(WebSocket) -> WebSocketFuture + 'static>;
 
 #[doc(hidden)]
 pub struct WebSocketPlan {
-    #[cfg(not(target_family = "wasm"))]
     key: String,
     selected_protocol: Option<String>,
     task: WebSocketTask,
-    #[cfg(not(target_family = "wasm"))]
-    native: NativeUpgrade,
 }
 
 impl WebSocketPlan {
-    #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn key(&self) -> &str {
+    #[doc(hidden)]
+    pub fn key(&self) -> &str {
         &self.key
     }
 
-    pub(crate) fn selected_protocol(&self) -> Option<&str> {
+    #[doc(hidden)]
+    pub fn selected_protocol(&self) -> Option<&str> {
         self.selected_protocol.as_deref()
     }
 
-    pub(crate) async fn run(self, socket: WebSocket) {
+    #[doc(hidden)]
+    pub async fn run(self, socket: WebSocket) {
         (self.task)(socket).await;
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn take_native_upgrade(&self) -> Option<hyper::upgrade::OnUpgrade> {
-        self.native.0.borrow_mut().take()
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
-#[derive(Clone)]
-pub(crate) struct NativeUpgrade(Rc<RefCell<Option<hyper::upgrade::OnUpgrade>>>);
-
-#[cfg(not(target_family = "wasm"))]
-impl NativeUpgrade {
-    pub(crate) fn new(on_upgrade: hyper::upgrade::OnUpgrade) -> Self {
-        Self(Rc::new(RefCell::new(Some(on_upgrade))))
     }
 }
 
@@ -354,7 +316,7 @@ mod tests {
     #[test]
     fn sends_and_receives_portable_messages() {
         let sent = Rc::new(RefCell::new(Vec::new()));
-        let mut socket = WebSocket::new(MockSocket {
+        let mut socket = WebSocket::from_io(MockSocket {
             incoming: VecDeque::from([WebSocketMessage::Text("hello".to_owned())]),
             sent: Rc::clone(&sent),
         });

@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+#![cfg(target_arch = "wasm32")]
+
 use std::{
     future::Future,
     pin::Pin,
@@ -11,15 +14,15 @@ use std::{cell::RefCell, collections::VecDeque, task::Waker};
 use futures_core::Stream;
 use worker::{Cf, Context, Env};
 
-use crate::{
-    EmptyRequestStream, FromRequest, Headers, IntoResponse, Method, Request, RequestStream,
-    Response, ResponseBody, ResponseStream, StreamError,
+use serverkit::{
+    FromRequest, Headers, IntoResponse, Method, Request, RequestStream, Response, ResponseBody,
+    ResponseStream, StreamError,
 };
 
 #[cfg(feature = "websocket")]
-use crate::{
+use serverkit::{
     WebSocket, WebSocketError, WebSocketMessage,
-    websocket::{WebSocketIo, WebSocketPlan},
+    adapter::{WebSocketIo, WebSocketPlan},
 };
 
 struct WorkerContextInner {
@@ -38,7 +41,7 @@ pub struct WorkerContextError;
 
 impl IntoResponse for WorkerContextError {
     fn into_response(self) -> Response {
-        Response::error(500, "Cloudflare worker context is unavailable")
+        Response::text(500, "Cloudflare worker context is unavailable")
     }
 }
 
@@ -78,14 +81,59 @@ impl<'request> FromRequest<(&'request Request, &'request [u8])> for WorkerContex
     }
 }
 
-impl RequestStream for worker::ByteStream {
+struct WorkerRequestStream {
+    stream: worker::ByteStream,
+    current: Vec<u8>,
+}
+
+impl WorkerRequestStream {
+    fn new(stream: worker::ByteStream) -> Self {
+        Self {
+            stream,
+            current: Vec::new(),
+        }
+    }
+}
+
+impl RequestStream for WorkerRequestStream {
     fn poll_next(
         &mut self,
         context: &mut TaskContext<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, StreamError>>> {
-        Pin::new(self).poll_next(context).map(|next| {
-            next.map(|chunk| chunk.map_err(|error| StreamError::new(error.to_string())))
-        })
+    ) -> Poll<Option<Result<(), StreamError>>> {
+        match Pin::new(&mut self.stream).poll_next(context) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.current = chunk;
+                Poll::Ready(Some(Ok(())))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.current.clear();
+                Poll::Ready(Some(Err(StreamError::new(error.to_string()))))
+            }
+            Poll::Ready(None) => {
+                self.current.clear();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn chunk(&self) -> &[u8] {
+        &self.current
+    }
+}
+
+struct EmptyRequestStream;
+
+impl RequestStream for EmptyRequestStream {
+    fn poll_next(
+        &mut self,
+        _context: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<(), StreamError>>> {
+        Poll::Ready(None)
+    }
+
+    fn chunk(&self) -> &[u8] {
+        &[]
     }
 }
 
@@ -101,16 +149,18 @@ pub fn from_request(
     let mut headers = Headers::new();
 
     for (name, value) in source.headers().entries() {
-        headers.append_unchecked(name, value);
+        headers
+            .append(name, value)
+            .expect("Workers supplied an invalid request header");
     }
 
     let body: Box<dyn RequestStream> = if source.inner().body().is_some() {
-        Box::new(source.stream()?)
+        Box::new(WorkerRequestStream::new(source.stream()?))
     } else {
         Box::new(EmptyRequestStream)
     };
 
-    let mut request = Request::new(method, path, query, headers, body);
+    let mut request = Request::from_parts(method, path, query, headers, body);
     request.insert_extension(WorkerContext::new(env, context, cf));
 
     Ok(request)
@@ -188,7 +238,7 @@ fn worker_websocket_response(plan: WebSocketPlan) -> worker::Result<worker::Resp
         close_worker_events(&event_queue);
     });
 
-    let socket = WebSocket::new(WorkerWebSocket { server, queue });
+    let socket = WebSocket::from_io(WorkerWebSocket { server, queue });
     worker::wasm_bindgen_futures::spawn_local(plan.run(socket));
 
     worker::Response::from_websocket(pair.client)

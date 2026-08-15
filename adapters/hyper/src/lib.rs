@@ -1,7 +1,9 @@
+#![forbid(unsafe_code)]
+
 use std::{
     convert::Infallible,
     io,
-    net::TcpListener,
+    net::{TcpListener, ToSocketAddrs},
     pin::Pin,
     rc::Rc,
     task::{Context, Poll},
@@ -28,21 +30,35 @@ use tokio_tungstenite::{
     },
 };
 
-use crate::{
+use serverkit::{
     Headers, Listener, Method, Request, RequestStream, Response, ResponseBody, Router, StreamError,
 };
 
 #[cfg(feature = "websocket")]
-use crate::{
+use serverkit::{
     WebSocket, WebSocketError, WebSocketMessage,
-    websocket::{NativeUpgrade, WebSocketIo, WebSocketPlan},
+    adapter::{WebSocketIo, WebSocketPlan},
 };
 
-impl Listener for TcpListener {
+pub struct Http1 {
+    listener: TcpListener,
+}
+
+impl Http1 {
+    pub fn bind(address: impl ToSocketAddrs) -> io::Result<Self> {
+        TcpListener::bind(address).map(Self::from_listener)
+    }
+
+    pub fn from_listener(listener: TcpListener) -> Self {
+        Self { listener }
+    }
+}
+
+impl Listener for Http1 {
     type Output = io::Result<()>;
 
     fn serve(self, router: Router) -> Self::Output {
-        serve(router, self)
+        serve(router, self.listener)
     }
 }
 
@@ -91,77 +107,91 @@ async fn handle_request(
     router: Rc<Router>,
     request: HyperRequest<Incoming>,
     address: std::net::SocketAddr,
-) -> HyperResponse<NativeResponseBody> {
+) -> HyperResponse<HyperResponseBody> {
     #[cfg(feature = "websocket")]
     let mut request = request;
     #[cfg(feature = "websocket")]
-    let native_upgrade = NativeUpgrade::new(hyper::upgrade::on(&mut request));
+    let on_upgrade = hyper::upgrade::on(&mut request);
     let (parts, body) = request.into_parts();
     let mut headers = Headers::new();
 
     for (name, value) in &parts.headers {
-        headers.append_unchecked(name.as_str(), value.as_bytes());
+        headers
+            .append(name.as_str(), value.as_bytes())
+            .expect("Hyper supplied an invalid request header");
     }
 
-    let mut request = Request::new(
+    let mut request = Request::from_parts(
         Method::new(parts.method.as_str()),
         parts.uri.path(),
         parts.uri.query().map(str::to_owned),
         headers,
-        Box::new(NativeRequestStream::new(body)),
+        Box::new(HyperRequestStream::new(body)),
     );
     request.insert_extension(address);
-    #[cfg(feature = "websocket")]
-    request.insert_extension(native_upgrade);
     let response = router.handle(request).await;
 
-    into_native_response(response)
+    into_hyper_response(
+        response,
+        #[cfg(feature = "websocket")]
+        on_upgrade,
+    )
 }
 
-struct NativeRequestStream {
+struct HyperRequestStream {
     body: Pin<Box<Incoming>>,
+    current: Option<Bytes>,
 }
 
-impl NativeRequestStream {
+impl HyperRequestStream {
     fn new(body: Incoming) -> Self {
         Self {
             body: Box::pin(body),
+            current: None,
         }
     }
 }
 
-impl RequestStream for NativeRequestStream {
-    fn poll_next(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, StreamError>>> {
+impl RequestStream for HyperRequestStream {
+    fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Result<(), StreamError>>> {
         loop {
             match self.body.as_mut().poll_frame(context) {
                 Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                    Ok(data) => return Poll::Ready(Some(Ok(data.to_vec()))),
+                    Ok(data) => {
+                        self.current = Some(data);
+                        return Poll::Ready(Some(Ok(())));
+                    }
                     Err(_) => continue,
                 },
                 Poll::Ready(Some(Err(error))) => {
+                    self.current = None;
                     return Poll::Ready(Some(Err(StreamError::new(error.to_string()))));
                 }
-                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(None) => {
+                    self.current = None;
+                    return Poll::Ready(None);
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
     }
+
+    fn chunk(&self) -> &[u8] {
+        self.current.as_deref().unwrap_or_default()
+    }
 }
 
-struct NativeResponseBody {
+struct HyperResponseBody {
     body: ResponseBody,
 }
 
-impl NativeResponseBody {
+impl HyperResponseBody {
     fn new(body: ResponseBody) -> Self {
         Self { body }
     }
 }
 
-impl HyperBody for NativeResponseBody {
+impl HyperBody for HyperResponseBody {
     type Data = Bytes;
     type Error = StreamError;
 
@@ -207,34 +237,30 @@ impl HyperBody for NativeResponseBody {
     }
 }
 
-fn into_native_response(response: Response) -> HyperResponse<NativeResponseBody> {
+fn into_hyper_response(
+    response: Response,
+    #[cfg(feature = "websocket")] on_upgrade: hyper::upgrade::OnUpgrade,
+) -> HyperResponse<HyperResponseBody> {
     let (status, headers, body) = response.into_parts();
 
     #[cfg(feature = "websocket")]
     let body = match body {
         ResponseBody::WebSocket(plan) => {
-            return into_native_websocket_response(headers, plan);
+            return into_hyper_websocket_response(headers, plan, on_upgrade);
         }
         body => body,
     };
 
     let length = body.buffered().map(<[u8]>::len);
     let has_content_length = headers.contains("content-length");
-    let mut response = HyperResponse::new(NativeResponseBody::new(body));
+    let mut response = HyperResponse::new(HyperResponseBody::new(body));
 
     match hyper::StatusCode::from_u16(status) {
         Ok(status) => *response.status_mut() = status,
         Err(_) => *response.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR,
     }
 
-    for (name, value) in headers.iter() {
-        let name = HeaderName::from_bytes(name.as_bytes())
-            .expect("ServerKit generated an invalid response header name");
-        let value = HeaderValue::from_bytes(value)
-            .expect("ServerKit generated an invalid response header value");
-
-        response.headers_mut().append(name, value);
-    }
+    append_headers(&mut response, headers);
 
     if !has_content_length && let Some(length) = length {
         response.headers_mut().insert(CONTENT_LENGTH, length.into());
@@ -243,17 +269,23 @@ fn into_native_response(response: Response) -> HyperResponse<NativeResponseBody>
     response
 }
 
+fn append_headers(response: &mut HyperResponse<HyperResponseBody>, headers: Headers) {
+    for (name, value) in headers.iter() {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .expect("ServerKit generated an invalid response header name");
+        let value = HeaderValue::from_bytes(value)
+            .expect("ServerKit generated an invalid response header value");
+
+        response.headers_mut().append(name, value);
+    }
+}
+
 #[cfg(feature = "websocket")]
-fn into_native_websocket_response(
+fn into_hyper_websocket_response(
     headers: Headers,
     plan: WebSocketPlan,
-) -> HyperResponse<NativeResponseBody> {
-    let Some(on_upgrade) = plan.take_native_upgrade() else {
-        return into_native_response(Response::error(
-            500,
-            "WebSocket runtime upgrade is unavailable",
-        ));
-    };
+    on_upgrade: hyper::upgrade::OnUpgrade,
+) -> HyperResponse<HyperResponseBody> {
     let accept_key = derive_accept_key(plan.key().as_bytes());
 
     tokio::task::spawn_local(async move {
@@ -262,11 +294,12 @@ fn into_native_websocket_response(
         };
         let stream =
             WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
-        plan.run(WebSocket::new(NativeWebSocket { stream })).await;
+        plan.run(WebSocket::from_io(HyperWebSocket { stream }))
+            .await;
     });
 
     let mut response =
-        HyperResponse::new(NativeResponseBody::new(ResponseBody::Buffered(Vec::new())));
+        HyperResponse::new(HyperResponseBody::new(ResponseBody::Buffered(Vec::new())));
     *response.status_mut() = hyper::StatusCode::SWITCHING_PROTOCOLS;
     response
         .headers_mut()
@@ -279,25 +312,18 @@ fn into_native_websocket_response(
         HeaderValue::from_str(&accept_key)
             .expect("a derived WebSocket accept key is a valid header value"),
     );
-
-    for (name, value) in headers.iter() {
-        let name = HeaderName::from_bytes(name.as_bytes())
-            .expect("ServerKit generated an invalid response header name");
-        let value = HeaderValue::from_bytes(value)
-            .expect("ServerKit generated an invalid response header value");
-        response.headers_mut().append(name, value);
-    }
+    append_headers(&mut response, headers);
 
     response
 }
 
 #[cfg(feature = "websocket")]
-struct NativeWebSocket {
+struct HyperWebSocket {
     stream: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
 }
 
 #[cfg(feature = "websocket")]
-impl WebSocketIo for NativeWebSocket {
+impl WebSocketIo for HyperWebSocket {
     fn poll_next(
         &mut self,
         context: &mut Context<'_>,
@@ -332,7 +358,7 @@ impl WebSocketIo for NativeWebSocket {
     }
 
     fn start_send(&mut self, message: WebSocketMessage) -> Result<(), WebSocketError> {
-        Sink::start_send(Pin::new(&mut self.stream), into_native_message(message))
+        Sink::start_send(Pin::new(&mut self.stream), into_hyper_message(message))
             .map_err(|error| WebSocketError::new(error.to_string()))
     }
 
@@ -348,7 +374,7 @@ impl WebSocketIo for NativeWebSocket {
 }
 
 #[cfg(feature = "websocket")]
-fn into_native_message(message: WebSocketMessage) -> Message {
+fn into_hyper_message(message: WebSocketMessage) -> Message {
     match message {
         WebSocketMessage::Text(text) => Message::Text(text.into()),
         WebSocketMessage::Binary(bytes) => Message::Binary(bytes.into()),

@@ -143,7 +143,7 @@ impl Response {
         self
     }
 
-    pub(crate) fn into_parts(self) -> (u16, Headers, ResponseBody) {
+    pub fn into_parts(self) -> (u16, Headers, ResponseBody) {
         (self.status, self.headers, self.body)
     }
 }

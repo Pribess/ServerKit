@@ -93,10 +93,11 @@ impl Multipart {
     async fn pull(&mut self) -> Result<(), MultipartError> {
         loop {
             match self.body.next().await {
-                Some(Ok(chunk)) if chunk.is_empty() => {}
                 Some(Ok(chunk)) => {
-                    self.buffer.extend_from_slice(&chunk);
-                    return Ok(());
+                    if !chunk.is_empty() {
+                        self.buffer.extend_from_slice(chunk);
+                        return Ok(());
+                    }
                 }
                 Some(Err(error)) => return Err(MultipartError::Stream(error)),
                 None => return Err(MultipartError::Malformed),
@@ -265,14 +266,27 @@ mod tests {
     use super::Multipart;
     use crate::{Body, RequestStream, StreamError};
 
-    struct Chunks(VecDeque<Vec<u8>>);
+    struct Chunks {
+        chunks: VecDeque<Vec<u8>>,
+        current: Vec<u8>,
+    }
 
     impl RequestStream for Chunks {
         fn poll_next(
             &mut self,
             _context: &mut Context<'_>,
-        ) -> Poll<Option<Result<Vec<u8>, StreamError>>> {
-            Poll::Ready(self.0.pop_front().map(Ok))
+        ) -> Poll<Option<Result<(), StreamError>>> {
+            match self.chunks.pop_front() {
+                Some(chunk) => {
+                    self.current = chunk;
+                    Poll::Ready(Some(Ok(())))
+                }
+                None => Poll::Ready(None),
+            }
+        }
+
+        fn chunk(&self) -> &[u8] {
+            &self.current
         }
     }
 
@@ -295,7 +309,13 @@ mod tests {
         let chunks = body.chunks(7).map(<[u8]>::to_vec).collect::<VecDeque<_>>();
         let mut multipart = Multipart {
             boundary: b"--boundary".to_vec(),
-            body: Body::new(Box::new(Chunks(chunks)), None),
+            body: Body::new(
+                Box::new(Chunks {
+                    chunks,
+                    current: Vec::new(),
+                }),
+                None,
+            ),
             buffer: Vec::new(),
             started: false,
             done: false,

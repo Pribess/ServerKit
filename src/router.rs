@@ -765,8 +765,12 @@ mod tests {
         fn poll_next(
             &mut self,
             _context: &mut Context<'_>,
-        ) -> Poll<Option<Result<Vec<u8>, StreamError>>> {
+        ) -> Poll<Option<Result<(), StreamError>>> {
             Poll::Ready(None)
+        }
+
+        fn chunk(&self) -> &[u8] {
+            &[]
         }
     }
 
@@ -873,7 +877,7 @@ mod tests {
     }
 
     fn request_with_method(method: &str, path: &str) -> Request {
-        Request::new(
+        Request::from_parts(
             Method::new(method),
             path,
             None,
@@ -893,7 +897,7 @@ mod tests {
             request_headers.append(name, value).unwrap();
         }
 
-        Request::new(
+        Request::from_parts(
             Method::new("GET"),
             path,
             query.map(str::to_owned),

@@ -1,37 +1,34 @@
 # ServerKit
 
-ServerKit is a portable Rust HTTP router with an Ohkami-inspired
-routing API. Native HTTP/1 serving is available through `std::net::TcpListener`;
-Cloudflare Workers use the same `Router`, routes, handlers, and extractors through
-the built-in adapter.
+ServerKit is a portable Rust HTTP router with an Ohkami-inspired routing API.
+The core stays runtime-independent; `serverkit-hyper` provides native HTTP/1
+serving and `serverkit-worker` connects the same `Router`, routes, handlers, and
+extractors to Cloudflare Workers.
 
 ## Installation
 
 ```toml
 [dependencies]
-serverkit = "0.1"
-
-# Optional buffered JSON extraction.
-serverkit = { version = "0.1", features = ["json"] }
+serverkit = { version = "0.1", features = ["json", "websocket"] }
 serde = { version = "1", features = ["derive"] }
+serverkit-hyper = { version = "0.1", features = ["websocket"] }
 
-# Portable WebSocket upgrades on native HTTP/1 and Workers.
-serverkit = { version = "0.1", features = ["websocket"] }
-
-# Cloudflare Workers adapter.
-serverkit = { version = "0.1", features = ["worker", "websocket"] }
+# Use these instead of serverkit-hyper on Cloudflare Workers.
+serverkit-worker = { version = "0.1", features = ["websocket"] }
 worker = "0.8.5"
 ```
+
+The `json` and `websocket` features are optional. Each runtime adapter keeps its
+runtime dependencies out of the `serverkit` core crate.
 
 ## Complete native server
 
 The same `Schema` derive decodes and validates path parameters, query
 parameters, and headers by name.
 
-```rust,no_run
-use std::net::TcpListener;
-
+```rust,ignore
 use serverkit::prelude::*;
+use serverkit_hyper::Http1;
 
 #[derive(Schema)]
 struct UserPath {
@@ -80,7 +77,7 @@ fn main() -> std::io::Result<()> {
         "/:organization/users/:id".GET(get_user),
     ));
 
-    router.run(TcpListener::bind("127.0.0.1:3000")?)
+    router.run(Http1::bind("127.0.0.1:3000")?)
 }
 ```
 
@@ -642,8 +639,9 @@ impl ValueSchema for Identifier {
 
 ## Streaming request bodies
 
-`Body` is the streaming extractor. Its `next` method returns one body chunk at
-a time.
+`Body` is the streaming extractor. Its `next` method borrows one body chunk at
+a time directly from the runtime adapter. The slice remains valid until the
+next mutable access to that `Body`.
 
 ```rust
 use serverkit::prelude::*;
@@ -652,7 +650,7 @@ async fn upload(mut body: Body) -> Result<Vec<u8>, StreamError> {
     let mut bytes = Vec::new();
 
     while let Some(chunk) = body.next().await {
-        bytes.extend(chunk?);
+        bytes.extend_from_slice(chunk?);
     }
 
     Ok(bytes)
@@ -693,8 +691,12 @@ impl RequestStream for EmptyStream {
     fn poll_next(
         &mut self,
         _context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Vec<u8>, StreamError>>> {
+    ) -> Poll<Option<Result<(), StreamError>>> {
         Poll::Ready(None)
+    }
+
+    fn chunk(&self) -> &[u8] {
+        &[]
     }
 }
 ```
@@ -816,8 +818,8 @@ let router = Router::new(Config::new(), ()).state(Configuration {
 ```
 
 Runtime-specific values can be inserted into a `Request` and cloned with
-`Extension<T>`. The native listener automatically provides the peer
-`SocketAddr` through `ConnectInfo<SocketAddr>`.
+`Extension<T>`. The Hyper adapter automatically provides the peer `SocketAddr`
+through `ConnectInfo<SocketAddr>`.
 
 ```rust
 use std::net::SocketAddr;
@@ -900,17 +902,15 @@ taking the same request stream.
 
 ## Cloudflare Workers
 
-Enable the `worker` feature. The adapter converts the host request before
-dispatch and converts ServerKit's buffered response afterward; the router
-itself stays runtime-independent.
+Add `serverkit-worker`. The adapter converts the host request before dispatch
+and converts the ServerKit response afterward; the router itself stays
+runtime-independent.
 
 ```rust,ignore
 use std::sync::LazyLock;
 
-use serverkit::{
-    Config, Router, RouteMethods,
-    cloudflare::{self, WorkerContext},
-};
+use serverkit::{Config, Router, RouteMethods};
+use serverkit_worker::{WorkerContext, from_request, into_response};
 use worker::{Context, Env, Request, Response, Result, event};
 
 static ROUTER: LazyLock<Router> = LazyLock::new(|| {
@@ -929,14 +929,11 @@ async fn colo(context: WorkerContext) -> String {
 
 #[event(fetch)]
 async fn fetch(request: Request, env: Env, context: Context) -> Result<Response> {
-    cloudflare::into_response(
-        ROUTER.handle(cloudflare::from_request(request, env, context)?)
-            .await,
-    )
+    into_response(ROUTER.handle(from_request(request, env, context)?).await)
 }
 ```
 
-`cloudflare::from_request` preserves method, path, query, headers, body stream,
+`serverkit_worker::from_request` preserves method, path, query, headers, body stream,
 `Env`, fetch `Context`, and `Cf`. `WorkerContext` is a normal non-buffering
 extractor. Its `env`, `context`, and `cf` accessors expose host data, while
 `wait_until` schedules work without delaying the response. The complete
@@ -1197,8 +1194,9 @@ Pass an `ExampleValue` to `Operation::request_example` or
 ## Listener adapters
 
 `Router::run` dispatches to the `Listener` implementation of the value passed by
-the user. `std::net::TcpListener` is implemented by ServerKit. Other runtimes
-can expose their own local wrapper type and implement the same trait.
+the user. `serverkit_hyper::Http1` owns a `std::net::TcpListener` and implements
+that trait. Other runtimes can expose their own local wrapper type and implement
+the same trait.
 
 ```rust
 use serverkit::{Config, Listener, Router};
@@ -1219,5 +1217,7 @@ let (_router, state) = router.run(TestListener);
 assert_eq!(state, "ready");
 ```
 
-The routing and extraction layer remains independent of the
-listener and request-stream adapter used by a native runtime or Worker host.
+The routing and extraction layer remains independent of the listener and
+request-stream adapter used by a native runtime or Worker host. An external
+adapter implements `RequestStream`, constructs `Request::from_parts`, calls
+`Router::handle`, and consumes the result with `Response::into_parts`.

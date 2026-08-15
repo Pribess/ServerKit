@@ -633,16 +633,21 @@ dependencies = [
 name = "serverkit"
 version = "0.1.0"
 dependencies = [
- "futures-core",
- "futures-util",
- "hyper",
- "hyper-util",
  "serde",
  "serde_json",
  "serverkit-macros",
+]
+
+[[package]]
+name = "serverkit-hyper"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "hyper",
+ "hyper-util",
+ "serverkit",
  "tokio",
  "tokio-tungstenite",
- "worker",
 ]
 
 [[package]]
@@ -652,6 +657,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "serverkit-worker"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "serverkit",
+ "worker",
 ]
 
 [[package]]
