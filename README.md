@@ -104,11 +104,14 @@ let router = Router::new(Config::new(), "/health".GET(health))
 
 ## HTTP methods
 
-Routes support `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, and `OPTIONS`.
-The same path can register a different handler for each method.
+Routes support `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`,
+`CONNECT`, and `TRACE`. The same path can register a different handler for each
+method. These methods are also available as allocation-free `Method` constants;
+other registered or custom methods retain their exact name through
+`Method::new`.
 
 ```rust
-use serverkit::{Config, Router, RouteMethods};
+use serverkit::{Config, Method, Router, RouteMethods};
 
 async fn read() -> &'static str {
     "read"
@@ -119,6 +122,7 @@ async fn create() -> &'static str {
 }
 
 fn router() -> Router {
+    assert_eq!(Method::GET.as_str(), "GET");
     Router::new(Config::new(), ("/items".GET(read), "/items".POST(create)))
 }
 ```

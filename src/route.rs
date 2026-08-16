@@ -83,7 +83,7 @@ macro_rules! route_methods {
                 ) -> Route<H, Arguments, Input> {
                     Route {
                         path: self,
-                        method: Method::new(stringify!($method)),
+                        method: Method::$method,
                         handler,
                         operation_modifiers: Vec::new(),
                         middlewares: Vec::new(),
@@ -96,7 +96,7 @@ macro_rules! route_methods {
     };
 }
 
-route_methods!(GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS);
+route_methods!(GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, CONNECT, TRACE);
 
 #[doc(hidden)]
 pub trait Routes {
@@ -176,6 +176,8 @@ mod tests {
                 "/delete".DELETE(accepted),
                 "/head".HEAD(accepted),
                 "/options".OPTIONS(accepted),
+                "/connect".CONNECT(accepted),
+                "/trace".TRACE(accepted),
             ),
         );
     }

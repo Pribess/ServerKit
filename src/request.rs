@@ -8,15 +8,93 @@ use std::{
 use crate::{IntoResponse, RequestStream, Response};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Method(String);
+pub struct Method(MethodRepr);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MethodRepr {
+    Connect,
+    Delete,
+    Get,
+    Head,
+    Options,
+    Patch,
+    Post,
+    Put,
+    Trace,
+    Other(Box<str>),
+}
 
 impl Method {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+    pub const CONNECT: Self = Self(MethodRepr::Connect);
+    pub const DELETE: Self = Self(MethodRepr::Delete);
+    pub const GET: Self = Self(MethodRepr::Get);
+    pub const HEAD: Self = Self(MethodRepr::Head);
+    pub const OPTIONS: Self = Self(MethodRepr::Options);
+    pub const PATCH: Self = Self(MethodRepr::Patch);
+    pub const POST: Self = Self(MethodRepr::Post);
+    pub const PUT: Self = Self(MethodRepr::Put);
+    pub const TRACE: Self = Self(MethodRepr::Trace);
+
+    pub fn new(value: impl AsRef<str>) -> Self {
+        match value.as_ref() {
+            "CONNECT" => Self::CONNECT,
+            "DELETE" => Self::DELETE,
+            "GET" => Self::GET,
+            "HEAD" => Self::HEAD,
+            "OPTIONS" => Self::OPTIONS,
+            "PATCH" => Self::PATCH,
+            "POST" => Self::POST,
+            "PUT" => Self::PUT,
+            "TRACE" => Self::TRACE,
+            other => Self(MethodRepr::Other(other.into())),
+        }
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        match &self.0 {
+            MethodRepr::Connect => "CONNECT",
+            MethodRepr::Delete => "DELETE",
+            MethodRepr::Get => "GET",
+            MethodRepr::Head => "HEAD",
+            MethodRepr::Options => "OPTIONS",
+            MethodRepr::Patch => "PATCH",
+            MethodRepr::Post => "POST",
+            MethodRepr::Put => "PUT",
+            MethodRepr::Trace => "TRACE",
+            MethodRepr::Other(method) => method,
+        }
+    }
+}
+
+#[cfg(test)]
+mod method_tests {
+    use super::Method;
+
+    #[test]
+    fn exposes_standard_methods_as_constants() {
+        let methods = [
+            (Method::CONNECT, "CONNECT"),
+            (Method::DELETE, "DELETE"),
+            (Method::GET, "GET"),
+            (Method::HEAD, "HEAD"),
+            (Method::OPTIONS, "OPTIONS"),
+            (Method::PATCH, "PATCH"),
+            (Method::POST, "POST"),
+            (Method::PUT, "PUT"),
+            (Method::TRACE, "TRACE"),
+        ];
+
+        for (method, name) in methods {
+            assert_eq!(method.as_str(), name);
+            assert_eq!(Method::new(name), method);
+        }
+    }
+
+    #[test]
+    fn preserves_other_methods() {
+        let method = Method::new("PROPFIND");
+
+        assert_eq!(method.as_str(), "PROPFIND");
     }
 }
 
