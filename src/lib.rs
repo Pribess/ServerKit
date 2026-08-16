@@ -52,7 +52,7 @@ pub use openapi::{
     ParameterLocation, Scalar, ScalarDeveloperTools, SecurityRequirement, SecurityScheme, Server,
 };
 
-pub use request::{Headers, InvalidHeader, Method, Request};
+pub use request::{Headers, InvalidHeader, InvalidMethod, Method, Request};
 
 pub use redirect::Redirect;
 
@@ -101,8 +101,9 @@ pub mod prelude {
 
     pub use crate::{
         Bytes, ConnectInfo, Cookie, Cookies, Extension, Form, FormError, InvalidHeader,
-        MissingConnectInfo, MissingExtension, MissingState, Multipart, MultipartError,
-        MultipartField, Redirect, SameSite, Sse, SseEvent, SseStream, State, Text, TextError,
+        InvalidMethod, MissingConnectInfo, MissingExtension, MissingState, Multipart,
+        MultipartError, MultipartField, Redirect, SameSite, Sse, SseEvent, SseStream, State, Text,
+        TextError,
     };
 
     #[cfg(feature = "json")]

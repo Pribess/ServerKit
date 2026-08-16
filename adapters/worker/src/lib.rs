@@ -142,7 +142,8 @@ pub fn from_request(
     env: Env,
     context: Context,
 ) -> worker::Result<Request> {
-    let method = Method::new(source.method().to_string());
+    let method = Method::try_from(source.method().to_string())
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
     let path = source.path();
     let query = source.url()?.query().map(str::to_owned);
     let cf = source.cf().cloned();

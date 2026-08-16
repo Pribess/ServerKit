@@ -66,6 +66,12 @@ macro_rules! route_methods {
     ($($method:ident),+ $(,)?) => {
         #[allow(non_snake_case)]
         pub trait RouteMethods {
+            fn on<Arguments, Input, H: Handler<Arguments, Input>>(
+                self,
+                method: Method,
+                handler: H,
+            ) -> Route<H, Arguments, Input>;
+
             $(
                 fn $method<Arguments, Input, H: Handler<Arguments, Input>>(
                     self,
@@ -76,20 +82,28 @@ macro_rules! route_methods {
 
         #[allow(non_snake_case)]
         impl RouteMethods for &'static str {
+            fn on<Arguments, Input, H: Handler<Arguments, Input>>(
+                self,
+                method: Method,
+                handler: H,
+            ) -> Route<H, Arguments, Input> {
+                Route {
+                    path: self,
+                    method,
+                    handler,
+                    operation_modifiers: Vec::new(),
+                    middlewares: Vec::new(),
+                    excluded_middlewares: Vec::new(),
+                    signature: PhantomData,
+                }
+            }
+
             $(
                 fn $method<Arguments, Input, H: Handler<Arguments, Input>>(
                     self,
                     handler: H,
                 ) -> Route<H, Arguments, Input> {
-                    Route {
-                        path: self,
-                        method: Method::$method,
-                        handler,
-                        operation_modifiers: Vec::new(),
-                        middlewares: Vec::new(),
-                        excluded_middlewares: Vec::new(),
-                        signature: PhantomData,
-                    }
+                    self.on(Method::$method, handler)
                 }
             )+
         }
@@ -149,7 +163,7 @@ serverkit_macros::impl_routes!(16);
 
 #[cfg(test)]
 mod tests {
-    use crate::{Config, RouteMethods, Router};
+    use crate::{Config, Method, RouteMethods, Router};
 
     async fn health() -> &'static str {
         "ok"
@@ -178,6 +192,7 @@ mod tests {
                 "/options".OPTIONS(accepted),
                 "/connect".CONNECT(accepted),
                 "/trace".TRACE(accepted),
+                "/propfind".on(Method::from_bytes(b"PROPFIND").unwrap(), accepted),
             ),
         );
     }

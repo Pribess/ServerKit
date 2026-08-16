@@ -140,7 +140,7 @@ async fn handle_request(
     }
 
     let mut request = Request::from_parts(
-        Method::new(parts.method.as_str()),
+        Method::try_from(parts.method.as_str()).expect("Hyper supplied an invalid request method"),
         parts.uri.path(),
         parts.uri.query().map(str::to_owned),
         headers,

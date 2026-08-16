@@ -517,6 +517,7 @@ impl Dispatcher {
     pub(crate) fn openapi_routes(&self) -> Vec<RouteDescription> {
         self.routes
             .iter()
+            .filter(|route| route.method.is_openapi_operation())
             .map(|route| {
                 let (path, path_parameters) = route.path.openapi_path();
 
@@ -878,7 +879,7 @@ mod tests {
 
     fn request_with_method(method: &str, path: &str) -> Request {
         Request::from_parts(
-            Method::new(method),
+            Method::try_from(method).unwrap(),
             path,
             None,
             Headers::new(),
@@ -898,7 +899,7 @@ mod tests {
         }
 
         Request::from_parts(
-            Method::new("GET"),
+            Method::GET,
             path,
             query.map(str::to_owned),
             request_headers,
@@ -913,6 +914,25 @@ mod tests {
 
         assert_eq!(response.status(), 200);
         assert_eq!(response.body(), b"ok");
+    }
+
+    #[test]
+    fn dispatches_a_custom_method() {
+        let method = Method::from_bytes(b"PROPFIND").unwrap();
+        let application = Router::new(
+            Config::new(),
+            "/files".on(method.clone(), || async { "properties" }),
+        );
+        let response = block_on(application.handle(Request::from_parts(
+            method,
+            "/files",
+            None,
+            Headers::new(),
+            Box::new(EmptyStream),
+        )));
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body(), b"properties");
     }
 
     #[test]

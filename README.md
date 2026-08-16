@@ -108,7 +108,7 @@ Routes support `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`,
 `CONNECT`, and `TRACE`. The same path can register a different handler for each
 method. These methods are also available as allocation-free `Method` constants;
 other registered or custom methods retain their exact name through
-`Method::new`.
+`Method::from_bytes` or `str::parse`.
 
 ```rust
 use serverkit::{Config, Method, Router, RouteMethods};
@@ -123,9 +123,20 @@ async fn create() -> &'static str {
 
 fn router() -> Router {
     assert_eq!(Method::GET.as_str(), "GET");
-    Router::new(Config::new(), ("/items".GET(read), "/items".POST(create)))
+    let propfind = Method::from_bytes(b"PROPFIND").unwrap();
+
+    Router::new(Config::new(), (
+        "/items".GET(read),
+        "/items".POST(create),
+        "/items".on(propfind, read),
+    ))
 }
 ```
+
+Method names use the HTTP `token` grammar, are case-sensitive, and reject empty,
+non-ASCII, whitespace, or separator-containing values. `CONNECT` and arbitrary
+methods are routable but omitted from generated OpenAPI documents because
+OpenAPI Path Item Objects do not define operation fields for them.
 
 An unsupported method on a matching path returns `405 Method Not Allowed` with
 an `Allow` header. If no explicit `HEAD` route exists, ServerKit executes the

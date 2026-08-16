@@ -2,6 +2,7 @@ use std::{
     any::{Any, TypeId},
     collections::HashMap,
     fmt,
+    str::FromStr,
     sync::Arc,
 };
 
@@ -35,19 +36,13 @@ impl Method {
     pub const PUT: Self = Self(MethodRepr::Put);
     pub const TRACE: Self = Self(MethodRepr::Trace);
 
-    pub fn new(value: impl AsRef<str>) -> Self {
-        match value.as_ref() {
-            "CONNECT" => Self::CONNECT,
-            "DELETE" => Self::DELETE,
-            "GET" => Self::GET,
-            "HEAD" => Self::HEAD,
-            "OPTIONS" => Self::OPTIONS,
-            "PATCH" => Self::PATCH,
-            "POST" => Self::POST,
-            "PUT" => Self::PUT,
-            "TRACE" => Self::TRACE,
-            other => Self(MethodRepr::Other(other.into())),
+    pub fn from_bytes(value: &[u8]) -> Result<Self, InvalidMethod> {
+        if !valid_method(value) {
+            return Err(InvalidMethod);
         }
+
+        let value = std::str::from_utf8(value).map_err(|_| InvalidMethod)?;
+        Ok(Self::standard(value).unwrap_or_else(|| Self(MethodRepr::Other(value.into()))))
     }
 
     pub fn as_str(&self) -> &str {
@@ -64,6 +59,107 @@ impl Method {
             MethodRepr::Other(method) => method,
         }
     }
+
+    pub(crate) fn is_openapi_operation(&self) -> bool {
+        !matches!(self.0, MethodRepr::Connect | MethodRepr::Other(_))
+    }
+
+    fn standard(value: &str) -> Option<Self> {
+        match value {
+            "CONNECT" => Some(Self::CONNECT),
+            "DELETE" => Some(Self::DELETE),
+            "GET" => Some(Self::GET),
+            "HEAD" => Some(Self::HEAD),
+            "OPTIONS" => Some(Self::OPTIONS),
+            "PATCH" => Some(Self::PATCH),
+            "POST" => Some(Self::POST),
+            "PUT" => Some(Self::PUT),
+            "TRACE" => Some(Self::TRACE),
+            _ => None,
+        }
+    }
+}
+
+impl FromStr for Method {
+    type Err = InvalidMethod;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_bytes(value.as_bytes())
+    }
+}
+
+impl TryFrom<&str> for Method {
+    type Error = InvalidMethod;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::from_bytes(value.as_bytes())
+    }
+}
+
+impl TryFrom<String> for Method {
+    type Error = InvalidMethod;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if !valid_method(value.as_bytes()) {
+            return Err(InvalidMethod);
+        }
+
+        Ok(Self::standard(&value)
+            .unwrap_or_else(|| Self(MethodRepr::Other(value.into_boxed_str()))))
+    }
+}
+
+impl AsRef<str> for Method {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for Method {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidMethod;
+
+impl InvalidMethod {
+    pub fn message(&self) -> &'static str {
+        "invalid HTTP method"
+    }
+}
+
+impl fmt::Display for InvalidMethod {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl std::error::Error for InvalidMethod {}
+
+fn valid_method(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value.iter().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 #[cfg(test)]
@@ -86,15 +182,22 @@ mod method_tests {
 
         for (method, name) in methods {
             assert_eq!(method.as_str(), name);
-            assert_eq!(Method::new(name), method);
+            assert_eq!(Method::from_bytes(name.as_bytes()).unwrap(), method);
         }
     }
 
     #[test]
     fn preserves_other_methods() {
-        let method = Method::new("PROPFIND");
+        let method = Method::from_bytes(b"PROPFIND").unwrap();
 
         assert_eq!(method.as_str(), "PROPFIND");
+    }
+
+    #[test]
+    fn rejects_invalid_method_tokens() {
+        for method in [b"".as_slice(), b"NOT VALID", b"GET/POST", b"m\xc3\xa9thod"] {
+            assert!(Method::from_bytes(method).is_err());
+        }
     }
 }
 

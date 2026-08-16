@@ -164,7 +164,7 @@ mod tests {
 
     impl Middleware for RewriteRequest {
         async fn handle(&self, mut request: Request, next: Next<'_>) -> Response {
-            request.method = Method::new("PATCH");
+            request.method = Method::PATCH;
             request.path = "/rewritten".to_owned();
             request.query = Some("source=middleware".to_owned());
             next.run(request).await
@@ -206,7 +206,7 @@ mod tests {
 
     fn request(path: &str) -> Request {
         Request::from_parts(
-            Method::new("GET"),
+            Method::GET,
             path,
             None,
             Headers::new(),

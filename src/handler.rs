@@ -249,7 +249,7 @@ mod tests {
 
     fn request(body: &[u8], polls: Rc<Cell<usize>>) -> Request {
         Request::from_parts(
-            Method::new("GET"),
+            Method::GET,
             "/",
             None,
             Headers::new(),

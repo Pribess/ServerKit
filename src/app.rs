@@ -352,7 +352,7 @@ mod tests {
 
     fn request(method: &str, path: &str) -> Request {
         Request::from_parts(
-            Method::new(method),
+            Method::try_from(method).unwrap(),
             path,
             None,
             Headers::new(),
@@ -409,6 +409,25 @@ mod tests {
 
         #[cfg(feature = "json")]
         serde_json::from_str::<serde_json::Value>(document).unwrap();
+    }
+
+    #[test]
+    fn omits_methods_without_openapi_operation_fields() {
+        let propfind = Method::from_bytes(b"PROPFIND").unwrap();
+        let application = Router::new(
+            Config::new(),
+            (
+                "/visible".GET(|| async { "visible" }),
+                "/tunnel".CONNECT(|| async { "tunnel" }),
+                "/properties".on(propfind, || async { "properties" }),
+            ),
+        )
+        .openapi("/docs", OpenApi::new("Methods", "1.0"));
+        let document = application.openapi_document().unwrap().as_str();
+
+        assert!(document.contains("\"/visible\""));
+        assert!(!document.contains("\"/tunnel\""));
+        assert!(!document.contains("\"/properties\""));
     }
 
     #[test]
