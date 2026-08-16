@@ -144,6 +144,10 @@ mod tests {
 
     struct InjectedHeader(String);
 
+    struct RewriteRequest;
+
+    struct RequestTarget(String);
+
     impl Middleware for Authentication {
         async fn handle(&self, request: Request, next: Next<'_>) -> Response {
             self.0.fetch_add(1, Ordering::Relaxed);
@@ -154,6 +158,15 @@ mod tests {
     impl Middleware for InjectHeader {
         async fn handle(&self, mut request: Request, next: Next<'_>) -> Response {
             request.headers.set("X-Injected", "middleware").unwrap();
+            next.run(request).await
+        }
+    }
+
+    impl Middleware for RewriteRequest {
+        async fn handle(&self, mut request: Request, next: Next<'_>) -> Response {
+            request.method = Method::new("PATCH");
+            request.path = "/rewritten".to_owned();
+            request.query = Some("source=middleware".to_owned());
             next.run(request).await
         }
     }
@@ -173,6 +186,21 @@ mod tests {
                 .to_owned();
 
             Ok(Self(value))
+        }
+    }
+
+    impl<'request> FromRequest<(&'request Request, &'request [u8])> for RequestTarget {
+        type Error = Infallible;
+
+        async fn from_request(
+            input: (&'request Request, &'request [u8]),
+        ) -> Result<Self, Self::Error> {
+            Ok(Self(format!(
+                "{} {}?{}",
+                input.0.method.as_str(),
+                input.0.path,
+                input.0.query.as_deref().unwrap_or_default(),
+            )))
         }
     }
 
@@ -279,6 +307,19 @@ mod tests {
         let response = block_on(router.handle(request("/header")));
 
         assert_eq!(response.body(), b"middleware");
+    }
+
+    #[test]
+    fn middleware_can_modify_the_request_target_before_extraction() {
+        let router = Router::new(
+            Config::new(),
+            "/original".GET(|RequestTarget(value): RequestTarget| async move { value }),
+        )
+        .middleware(RewriteRequest);
+
+        let response = block_on(router.handle(request("/original")));
+
+        assert_eq!(response.body(), b"PATCH /rewritten?source=middleware");
     }
 
     #[test]

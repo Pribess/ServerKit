@@ -291,6 +291,14 @@ directly to the route. Scoped middleware also runs for a scoped fallback and
 for generated responses such as 404, 405, and automatic OPTIONS within that
 scope; route middleware only runs after a route is selected.
 
+`Request::method`, `Request::path`, `Request::query`, and `Request::headers` are
+public fields, so middleware can replace request metadata before extraction.
+Routing and path-parameter capture have already completed before middleware
+runs; changing `method` or `path` affects downstream middleware and extractors
+but does not select a different route or recalculate path parameters. Request
+body replacement remains internal until its streaming transformation API is
+defined.
+
 ## Query extraction
 
 Query schemas ignore undeclared fields by default. Repeated names decode into

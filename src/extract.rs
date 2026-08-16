@@ -25,7 +25,7 @@ impl<'request> FromRequest<(&'request Request, &'request [u8])> for Method {
     type Error = Infallible;
 
     async fn from_request(input: (&'request Request, &'request [u8])) -> Result<Self, Self::Error> {
-        Ok(input.0.method().clone())
+        Ok(input.0.method.clone())
     }
 }
 
@@ -280,7 +280,7 @@ impl<'request, T: Schema> FromRequest<(&'request Request, &'request [u8])> for Q
     type Error = QueryError;
 
     async fn from_request(input: (&'request Request, &'request [u8])) -> Result<Self, Self::Error> {
-        let query = QueryValues::new(input.0.query()).map_err(QueryError)?;
+        let query = QueryValues::new(input.0.query.as_deref()).map_err(QueryError)?;
 
         T::decode(&query, schema_options::<T>(UnknownFields::Ignore))
             .map(Self)

@@ -435,7 +435,7 @@ impl Dispatcher {
         let mut best_path: Option<&RoutePath> = None;
 
         for route in &self.routes {
-            let Some(captures) = route.path.captures(request.path()) else {
+            let Some(captures) = route.path.captures(&request.path) else {
                 continue;
             };
 
@@ -452,7 +452,7 @@ impl Dispatcher {
         }
 
         if matched.is_empty() {
-            if let Some(fallback) = self.fallback(request.path()) {
+            if let Some(fallback) = self.fallback(&request.path) {
                 return Dispatch::Fallback(fallback);
             }
 
@@ -460,7 +460,7 @@ impl Dispatcher {
         }
 
         let allow = allow_header(&matched);
-        let requested = request.method().as_str();
+        let requested = request.method.as_str();
         let is_head = requested == "HEAD";
 
         if requested == "OPTIONS" {

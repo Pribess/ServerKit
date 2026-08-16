@@ -150,9 +150,7 @@ impl Router {
 
     pub async fn handle(&self, mut request: Request) -> Response {
         let terminal = match self.openapi.as_ref() {
-            Some(published) if request.path() == published.path => {
-                RouterTerminal::OpenApi(published)
-            }
+            Some(published) if request.path == published.path => RouterTerminal::OpenApi(published),
             _ => RouterTerminal::Dispatch(self.dispatcher.resolve(&request)),
         };
         let exclusions = terminal.excluded_middlewares();
@@ -160,7 +158,7 @@ impl Router {
         let mut body_limit = None;
         let mut middlewares = Vec::new();
 
-        if self.scope.matches(request.path()) {
+        if self.scope.matches(&request.path) {
             apply_scope(
                 &self.scope,
                 exclusions,
@@ -170,7 +168,7 @@ impl Router {
             );
         }
 
-        for scope in self.dispatcher.matching_scopes(request.path()) {
+        for scope in self.dispatcher.matching_scopes(&request.path) {
             apply_scope(
                 scope,
                 exclusions,
@@ -274,7 +272,7 @@ impl MiddlewareTerminal for RouterTerminal<'_> {
                         Response::bytes(200, published.scalar_page.as_bytes().to_vec());
                     response.set_header("Content-Type", "text/html; charset=utf-8");
 
-                    let mut response = match request.method().as_str() {
+                    let mut response = match request.method.as_str() {
                         "GET" => response,
                         "HEAD" => response.without_body(),
                         "OPTIONS" => Response::empty(),

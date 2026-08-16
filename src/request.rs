@@ -176,9 +176,9 @@ fn validate_header(name: &str, value: &[u8]) -> Result<(), InvalidHeader> {
 }
 
 pub struct Request {
-    method: Method,
-    path: String,
-    query: Option<String>,
+    pub method: Method,
+    pub path: String,
+    pub query: Option<String>,
     pub headers: Headers,
     params: Vec<(String, String)>,
     extensions: HashMap<TypeId, Box<dyn Any>>,
@@ -206,18 +206,6 @@ impl Request {
             body_limit: None,
             body,
         }
-    }
-
-    pub fn method(&self) -> &Method {
-        &self.method
-    }
-
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-
-    pub fn query(&self) -> Option<&str> {
-        self.query.as_deref()
     }
 
     pub(crate) fn params(&self) -> &[(String, String)] {
