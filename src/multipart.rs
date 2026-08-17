@@ -8,17 +8,19 @@ pub struct Multipart {
     body: Body,
     buffer: Vec<u8>,
     started: bool,
+    field_open: bool,
     done: bool,
 }
 
 impl Multipart {
-    pub async fn next(&mut self) -> Option<Result<MultipartField, MultipartError>> {
+    pub async fn next(&mut self) -> Option<Result<MultipartField<'_>, MultipartError>> {
         if self.done {
             return None;
         }
 
-        match self.next_field().await {
-            Ok(field) => field.map(Ok),
+        match self.prepare_field().await {
+            Ok(Some(headers)) => Some(Ok(multipart_field(headers, self))),
+            Ok(None) => None,
             Err(error) => {
                 self.done = true;
                 Some(Err(error))
@@ -26,12 +28,16 @@ impl Multipart {
         }
     }
 
-    async fn next_field(&mut self) -> Result<Option<MultipartField>, MultipartError> {
+    async fn prepare_field(&mut self) -> Result<Option<Headers>, MultipartError> {
+        if self.field_open {
+            self.discard_field().await?;
+        }
+
         if !self.started {
-            let boundary_length = self.boundary.len();
+            let boundary_length = self.boundary.len() - 2;
             self.ensure(boundary_length).await?;
 
-            if !self.buffer.starts_with(&self.boundary) {
+            if !self.buffer.starts_with(&self.boundary[2..]) {
                 return Err(MultipartError::Malformed);
             }
 
@@ -66,20 +72,43 @@ impl Multipart {
         let header_bytes = self.buffer[..header_end].to_vec();
         self.buffer.drain(..header_end + 4);
         let headers = parse_headers(&header_bytes)?;
-        let mut delimiter = Vec::with_capacity(self.boundary.len() + 2);
-        delimiter.extend_from_slice(b"\r\n");
-        delimiter.extend_from_slice(&self.boundary);
-        let field_end = loop {
-            if let Some(index) = find_bytes(&self.buffer, &delimiter) {
-                break index;
+        self.field_open = true;
+
+        Ok(Some(headers))
+    }
+
+    async fn next_field_chunk(&mut self) -> Result<Option<Vec<u8>>, MultipartError> {
+        if !self.field_open {
+            return Ok(None);
+        }
+
+        loop {
+            if let Some(index) = find_bytes(&self.buffer, &self.boundary) {
+                let bytes = self.buffer.drain(..index).collect::<Vec<_>>();
+                self.buffer.drain(..self.boundary.len());
+                self.field_open = false;
+
+                return if bytes.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(bytes))
+                };
+            }
+
+            let retained = self.boundary.len() - 1;
+
+            if self.buffer.len() > retained {
+                let available = self.buffer.len() - retained;
+                return Ok(Some(self.buffer.drain(..available).collect()));
             }
 
             self.pull().await?;
-        };
-        let bytes = self.buffer[..field_end].to_vec();
-        self.buffer.drain(..field_end + delimiter.len());
+        }
+    }
 
-        Ok(Some(multipart_field(headers, bytes)))
+    async fn discard_field(&mut self) -> Result<(), MultipartError> {
+        while self.next_field_chunk().await?.is_some() {}
+        Ok(())
     }
 
     async fn ensure(&mut self, length: usize) -> Result<(), MultipartError> {
@@ -106,15 +135,15 @@ impl Multipart {
     }
 }
 
-pub struct MultipartField {
+pub struct MultipartField<'multipart> {
+    multipart: &'multipart mut Multipart,
     headers: Headers,
     name: Option<String>,
     file_name: Option<String>,
     content_type: Option<String>,
-    bytes: Vec<u8>,
 }
 
-impl MultipartField {
+impl MultipartField<'_> {
     pub fn headers(&self) -> &Headers {
         &self.headers
     }
@@ -131,16 +160,30 @@ impl MultipartField {
         self.content_type.as_deref()
     }
 
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+    pub async fn next(&mut self) -> Option<Result<Vec<u8>, MultipartError>> {
+        match self.multipart.next_field_chunk().await {
+            Ok(Some(chunk)) => Some(Ok(chunk)),
+            Ok(None) => None,
+            Err(error) => {
+                self.multipart.done = true;
+                self.multipart.field_open = false;
+                Some(Err(error))
+            }
+        }
     }
 
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+    pub async fn bytes(mut self) -> Result<Vec<u8>, MultipartError> {
+        let mut bytes = Vec::new();
+
+        while let Some(chunk) = self.next().await {
+            bytes.extend_from_slice(&chunk?);
+        }
+
+        Ok(bytes)
     }
 
-    pub fn text(&self) -> Result<&str, std::str::Utf8Error> {
-        std::str::from_utf8(&self.bytes)
+    pub async fn text(self) -> Result<String, MultipartError> {
+        String::from_utf8(self.bytes().await?).map_err(MultipartError::Text)
     }
 }
 
@@ -150,6 +193,7 @@ pub enum MultipartError {
     Boundary,
     Malformed,
     Stream(StreamError),
+    Text(std::string::FromUtf8Error),
 }
 
 impl IntoResponse for MultipartError {
@@ -159,6 +203,7 @@ impl IntoResponse for MultipartError {
             Self::Boundary => Response::error(400, "multipart boundary is missing or invalid"),
             Self::Malformed => Response::error(400, "multipart request body is malformed"),
             Self::Stream(error) => error.into_response(),
+            Self::Text(error) => Response::error(400, error.to_string()),
         }
     }
 }
@@ -182,8 +227,8 @@ impl FromRequest<Request> for Multipart {
             .filter(|value| !value.is_empty() && value.len() <= 70)
             .ok_or(MultipartError::Boundary)?
             .as_bytes();
-        let mut delimiter = Vec::with_capacity(boundary.len() + 2);
-        delimiter.extend_from_slice(b"--");
+        let mut delimiter = Vec::with_capacity(boundary.len() + 4);
+        delimiter.extend_from_slice(b"\r\n--");
         delimiter.extend_from_slice(boundary);
         let limit = input.body_limit();
 
@@ -192,6 +237,7 @@ impl FromRequest<Request> for Multipart {
             body: Body::new(input.body, limit),
             buffer: Vec::new(),
             started: false,
+            field_open: false,
             done: false,
         })
     }
@@ -216,7 +262,7 @@ fn parse_headers(bytes: &[u8]) -> Result<Headers, MultipartError> {
     Ok(headers)
 }
 
-fn multipart_field(headers: Headers, bytes: Vec<u8>) -> MultipartField {
+fn multipart_field(headers: Headers, multipart: &mut Multipart) -> MultipartField<'_> {
     let disposition = headers
         .get("content-disposition")
         .and_then(|value| std::str::from_utf8(value).ok());
@@ -228,11 +274,11 @@ fn multipart_field(headers: Headers, bytes: Vec<u8>) -> MultipartField {
         .map(str::to_owned);
 
     MultipartField {
+        multipart,
         headers,
         name,
         file_name,
         content_type,
-        bytes,
     }
 }
 
@@ -303,12 +349,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_fields_and_files() {
-        let body = b"--boundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\ncontent\r\n--boundary--\r\n";
-        let chunks = body.chunks(7).map(<[u8]>::to_vec).collect::<VecDeque<_>>();
-        let mut multipart = Multipart {
-            boundary: b"--boundary".to_vec(),
+    fn multipart(body: &[u8], chunk_size: usize) -> Multipart {
+        let chunks = body
+            .chunks(chunk_size)
+            .map(<[u8]>::to_vec)
+            .collect::<VecDeque<_>>();
+
+        Multipart {
+            boundary: b"\r\n--boundary".to_vec(),
             body: Body::new(
                 Box::new(Chunks {
                     chunks,
@@ -318,15 +366,68 @@ mod tests {
             ),
             buffer: Vec::new(),
             started: false,
+            field_open: false,
             done: false,
-        };
+        }
+    }
+
+    #[test]
+    fn parses_fields_and_files() {
+        let body = b"--boundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\ncontent\r\n--boundary--\r\n";
+        let mut multipart = multipart(body, 7);
         let first = block_on(multipart.next()).unwrap().unwrap();
-        let second = block_on(multipart.next()).unwrap().unwrap();
 
         assert_eq!(first.name(), Some("title"));
-        assert_eq!(first.bytes(), b"hello");
+        assert_eq!(block_on(first.text()).unwrap(), "hello");
+
+        let second = block_on(multipart.next()).unwrap().unwrap();
         assert_eq!(second.file_name(), Some("a.txt"));
         assert_eq!(second.content_type(), Some("text/plain"));
+        assert_eq!(block_on(second.bytes()).unwrap(), b"content");
+        assert!(block_on(multipart.next()).is_none());
+    }
+
+    #[test]
+    fn streams_large_fields_in_bounded_chunks() {
+        let content = vec![7; 256 * 1024];
+        let mut body = b"--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"large.bin\"\r\n\r\n".to_vec();
+        body.extend_from_slice(&content);
+        body.extend_from_slice(b"\r\n--boundary--\r\n");
+        let mut multipart = multipart(&body, 1024);
+        let mut field = block_on(multipart.next()).unwrap().unwrap();
+        let mut received = Vec::new();
+        let mut largest = 0;
+
+        while let Some(chunk) = block_on(field.next()) {
+            let chunk = chunk.unwrap();
+            largest = largest.max(chunk.len());
+            received.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(received, content);
+        assert!(largest <= 2048);
+        drop(field);
+        assert!(block_on(multipart.next()).is_none());
+    }
+
+    #[test]
+    fn discards_an_unread_field_before_parsing_the_next_one() {
+        let content = vec![7; 32 * 1024];
+        let mut body =
+            b"--boundary\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\n".to_vec();
+        body.extend_from_slice(&content);
+        body.extend_from_slice(b"\r\n--boundary\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nafter\r\n--boundary--\r\n");
+        let mut multipart = multipart(&body, 128);
+
+        {
+            let mut first = block_on(multipart.next()).unwrap().unwrap();
+            assert_eq!(first.name(), Some("file"));
+            assert!(block_on(first.next()).unwrap().unwrap().len() <= 256);
+        }
+
+        let second = block_on(multipart.next()).unwrap().unwrap();
+        assert_eq!(second.name(), Some("title"));
+        assert_eq!(block_on(second.text()).unwrap(), "after");
         assert!(block_on(multipart.next()).is_none());
     }
 }

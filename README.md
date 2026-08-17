@@ -814,18 +814,26 @@ let router = Router::new(Config::new(), ()).body_limit(2 * 1024 * 1024);
 ## Multipart
 
 `Multipart` is a final streaming extractor. Parsing begins only when `next()`
-is called, boundaries may span runtime chunks, and only the current field is
-buffered. The configured body limit remains active across the complete body.
+is called, boundaries may span runtime chunks, and field contents are exposed
+one chunk at a time without buffering an entire file. The configured body limit
+remains active across the complete body.
 
 ```rust
 use serverkit::{Multipart, MultipartError};
 
 async fn upload(mut multipart: Multipart) -> Result<String, MultipartError> {
     while let Some(field) = multipart.next().await {
-        let field = field?;
+        let mut field = field?;
 
         if field.name() == Some("title") {
-            return Ok(field.text().unwrap_or_default().to_owned());
+            return field.text().await;
+        }
+
+        if field.file_name().is_some() {
+            while let Some(chunk) = field.next().await {
+                let chunk = chunk?;
+                // Write `chunk` to a file or object store here.
+            }
         }
     }
 
@@ -834,7 +842,10 @@ async fn upload(mut multipart: Multipart) -> Result<String, MultipartError> {
 ```
 
 Each `MultipartField` exposes `headers`, `name`, `file_name`, `content_type`,
-`bytes`, `into_bytes`, and UTF-8 `text` accessors.
+and streaming `next` accessors. `bytes().await` and `text().await` remain
+available when a small field should be collected. Dropping a field before it is
+fully read causes `Multipart` to discard its remaining contents before parsing
+the next field.
 
 ## State, extensions, connection information, and cookies
 
@@ -1044,15 +1055,15 @@ in values.
 
 `Response::stream` accepts a runtime-neutral `ResponseStream` and is forwarded
 without buffering by both native HTTP and Cloudflare Workers.
-`poll_next` advances the stream, and `chunk` borrows bytes owned by the stream
-until its next mutable call. Implementations can therefore reuse one allocation
-instead of allocating and transferring a new `Vec<u8>` for every chunk. The
-current Hyper and Workers host APIs require owned output values, so their
-adapters copy each borrowed chunk at that final boundary.
+`poll_next` transfers an owned `Chunk` to the runtime adapter. `Chunk::from`
+moves a generated `Vec<u8>` without copying it, while `Chunk::shared` reuses
+cached bytes through an `Arc`. Hyper forwards both forms without copying at the
+adapter boundary. Cloudflare Workers still perform their required host-boundary
+copy into a JavaScript `Uint8Array`.
 
 ```rust
 use std::task::{Context, Poll};
-use serverkit::{Response, ResponseStream, StreamError};
+use serverkit::{Chunk, Response, ResponseStream, StreamError};
 
 struct Chunks {
     chunk: Vec<u8>,
@@ -1063,17 +1074,15 @@ impl ResponseStream for Chunks {
     fn poll_next(
         &mut self,
         _context: &mut Context<'_>,
-    ) -> Poll<Option<Result<(), StreamError>>> {
+    ) -> Poll<Option<Result<Chunk, StreamError>>> {
         if self.sent {
             Poll::Ready(None)
         } else {
             self.sent = true;
-            Poll::Ready(Some(Ok(())))
+            Poll::Ready(Some(Ok(Chunk::from(
+                std::mem::take(&mut self.chunk),
+            ))))
         }
-    }
-
-    fn chunk(&self) -> &[u8] {
-        &self.chunk
     }
 }
 
