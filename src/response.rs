@@ -238,7 +238,7 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use crate::{
-        Cookie, IntoResponse, Redirect, Response, ResponseBody, ResponseStream, StreamError,
+        Chunk, Cookie, IntoResponse, Redirect, Response, ResponseBody, ResponseStream, StreamError,
     };
 
     struct OneChunk {
@@ -250,17 +250,13 @@ mod tests {
         fn poll_next(
             &mut self,
             _context: &mut Context<'_>,
-        ) -> Poll<Option<Result<(), StreamError>>> {
+        ) -> Poll<Option<Result<Chunk, StreamError>>> {
             if self.sent {
                 Poll::Ready(None)
             } else {
                 self.sent = true;
-                Poll::Ready(Some(Ok(())))
+                Poll::Ready(Some(Ok(Chunk::from(std::mem::take(&mut self.chunk)))))
             }
-        }
-
-        fn chunk(&self) -> &[u8] {
-            &self.chunk
         }
     }
 
@@ -321,11 +317,10 @@ mod tests {
         };
         let mut context = Context::from_waker(Waker::noop());
 
-        assert!(matches!(
-            stream.poll_next(&mut context),
-            Poll::Ready(Some(Ok(())))
-        ));
-        assert_eq!(stream.chunk(), b"chunk");
+        let Poll::Ready(Some(Ok(chunk))) = stream.poll_next(&mut context) else {
+            panic!("expected a response chunk");
+        };
+        assert_eq!(chunk.bytes(), b"chunk");
         assert!(matches!(stream.poll_next(&mut context), Poll::Ready(None)));
 
         let mut redirect = Redirect::temporary("/next").into_response();

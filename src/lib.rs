@@ -74,7 +74,7 @@ pub use route::Routes;
 
 pub(crate) use router::{Dispatch, Dispatcher, Scope};
 
-pub use stream::{RequestStream, ResponseStream, StreamError};
+pub use stream::{Chunk, RequestStream, ResponseStream, StreamError};
 
 #[cfg(feature = "websocket")]
 pub use websocket::{
@@ -89,7 +89,7 @@ pub mod adapter {
 
 pub mod prelude {
     pub use crate::{
-        ApiKeyLocation, Body, Config, DecodeOptions, ExampleValue, ExtraFields, FromRequest,
+        ApiKeyLocation, Body, Chunk, Config, DecodeOptions, ExampleValue, ExtraFields, FromRequest,
         Handler, Header, HeaderError, Headers, IntoResponse, Listener, Method, Middleware, Next,
         OAuthFlow, OAuthFlows, OpenApi, OpenApiDocument, Operation, ParameterLocation, Path,
         PathError, Query, QueryError, Request, RequestStream, Response, ResponseBody,

@@ -32,7 +32,8 @@ use tokio_tungstenite::{
 };
 
 use serverkit::{
-    Headers, Listener, Method, Request, RequestStream, Response, ResponseBody, Router, StreamError,
+    Chunk, Headers, Listener, Method, Request, RequestStream, Response, ResponseBody, Router,
+    StreamError,
 };
 
 #[cfg(feature = "websocket")]
@@ -203,6 +204,22 @@ struct HyperResponseBody {
     body: ResponseBody,
 }
 
+struct HyperChunk(Chunk);
+
+impl hyper::body::Buf for HyperChunk {
+    fn remaining(&self) -> usize {
+        self.0.remaining()
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.0.bytes()
+    }
+
+    fn advance(&mut self, count: usize) {
+        self.0.advance(count);
+    }
+}
+
 impl HyperResponseBody {
     fn new(body: ResponseBody) -> Self {
         Self { body }
@@ -210,7 +227,7 @@ impl HyperResponseBody {
 }
 
 impl HyperBody for HyperResponseBody {
-    type Data = Bytes;
+    type Data = HyperChunk;
     type Error = StreamError;
 
     fn poll_frame(
@@ -220,13 +237,13 @@ impl HyperBody for HyperResponseBody {
         match &mut self.get_mut().body {
             ResponseBody::Buffered(bytes) if bytes.is_empty() => Poll::Ready(None),
             ResponseBody::Buffered(bytes) => {
-                let bytes = Bytes::from(std::mem::take(bytes));
-                Poll::Ready(Some(Ok(Frame::data(bytes))))
+                let chunk = HyperChunk(Chunk::from(std::mem::take(bytes)));
+                Poll::Ready(Some(Ok(Frame::data(chunk))))
             }
             ResponseBody::Streaming(stream) => match stream.poll_next(context) {
-                Poll::Ready(Some(Ok(()))) => Poll::Ready(Some(Ok(Frame::data(
-                    Bytes::copy_from_slice(stream.chunk()),
-                )))),
+                Poll::Ready(Some(Ok(chunk))) => {
+                    Poll::Ready(Some(Ok(Frame::data(HyperChunk(chunk)))))
+                }
                 Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
@@ -412,18 +429,46 @@ fn into_hyper_message(message: WebSocketMessage) -> Message {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, rc::Rc};
+    use std::{
+        net::TcpListener,
+        rc::Rc,
+        task::{Context, Poll},
+    };
 
-    use http_body_util::Empty;
+    use http_body_util::{BodyExt, Empty};
     use hyper::{Request, body::Bytes, client::conn::http2};
     use hyper_util::rt::TokioIo;
-    use serverkit::{Config, RouteMethods, Router};
+    use serverkit::{Chunk, Config, Response, ResponseStream, RouteMethods, Router, StreamError};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{LocalExecutor, serve_connection};
 
+    struct LargeStream {
+        sent: bool,
+    }
+
+    impl ResponseStream for LargeStream {
+        fn poll_next(
+            &mut self,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Chunk, StreamError>>> {
+            if self.sent {
+                Poll::Ready(None)
+            } else {
+                self.sent = true;
+                Poll::Ready(Some(Ok(Chunk::from(vec![7; 1024 * 1024]))))
+            }
+        }
+    }
+
     fn router() -> Router {
-        Router::new(Config::new(), "/health".GET(|| async { "ok" }))
+        Router::new(
+            Config::new(),
+            (
+                "/health".GET(|| async { "ok" }),
+                "/stream".GET(|| async { Response::stream(200, LargeStream { sent: false }) }),
+            ),
+        )
     }
 
     fn listener() -> (TcpListener, std::net::SocketAddr) {
@@ -495,6 +540,16 @@ mod tests {
 
             assert_eq!(response.version(), hyper::Version::HTTP_2);
             assert_eq!(response.status(), hyper::StatusCode::OK);
+
+            let request = Request::builder()
+                .uri("http://localhost/stream")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let response = sender.send_request(request).await.unwrap();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+
+            assert_eq!(body.len(), 1024 * 1024);
+            assert!(body.iter().all(|byte| *byte == 7));
         });
     }
 }

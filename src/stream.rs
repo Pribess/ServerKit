@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -16,15 +17,85 @@ pub trait RequestStream {
     fn chunk(&self) -> &[u8];
 }
 
-pub trait ResponseStream {
-    /// Advances to the next chunk without transferring its allocation.
-    ///
-    /// After returning `Poll::Ready(Some(Ok(())))`, `chunk` must expose the
-    /// new chunk until the next mutable call to this stream.
-    fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Result<(), StreamError>>>;
+#[derive(Debug)]
+pub struct Chunk {
+    bytes: ChunkBytes,
+    position: usize,
+}
 
-    /// Borrows the chunk produced by the latest successful `poll_next` call.
-    fn chunk(&self) -> &[u8];
+#[derive(Debug)]
+enum ChunkBytes {
+    Owned(Vec<u8>),
+    Shared(Arc<Vec<u8>>),
+}
+
+impl Chunk {
+    pub fn shared(bytes: Arc<Vec<u8>>) -> Self {
+        Self {
+            bytes: ChunkBytes::Shared(bytes),
+            position: 0,
+        }
+    }
+
+    pub fn remaining(&self) -> usize {
+        let length = match &self.bytes {
+            ChunkBytes::Owned(bytes) => bytes.len(),
+            ChunkBytes::Shared(bytes) => bytes.len(),
+        };
+
+        length - self.position
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        let bytes = match &self.bytes {
+            ChunkBytes::Owned(bytes) => bytes,
+            ChunkBytes::Shared(bytes) => bytes,
+        };
+
+        &bytes[self.position..]
+    }
+
+    pub fn advance(&mut self, count: usize) {
+        assert!(count <= self.remaining(), "cannot advance past the chunk");
+        self.position += count;
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        let mut bytes = match self.bytes {
+            ChunkBytes::Owned(bytes) => bytes,
+            ChunkBytes::Shared(bytes) => match Arc::try_unwrap(bytes) {
+                Ok(bytes) => bytes,
+                Err(bytes) => return bytes[self.position..].to_vec(),
+            },
+        };
+
+        if self.position != 0 {
+            let remaining = bytes.len() - self.position;
+            bytes.copy_within(self.position.., 0);
+            bytes.truncate(remaining);
+        }
+
+        bytes
+    }
+}
+
+impl From<Vec<u8>> for Chunk {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: ChunkBytes::Owned(bytes),
+            position: 0,
+        }
+    }
+}
+
+impl AsRef<[u8]> for Chunk {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes()
+    }
+}
+
+pub trait ResponseStream {
+    fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Result<Chunk, StreamError>>>;
 }
 
 #[derive(Debug)]
@@ -167,5 +238,53 @@ impl RequestStream for BufferedRequestStream {
 
     fn chunk(&self) -> &[u8] {
         &self.buffered
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::Chunk;
+
+    #[test]
+    fn owned_chunks_move_their_allocation() {
+        let bytes = b"chunk".to_vec();
+        let pointer = bytes.as_ptr();
+        let chunk = Chunk::from(bytes);
+        let bytes = chunk.into_vec();
+
+        assert_eq!(bytes.as_ptr(), pointer);
+        assert_eq!(bytes, b"chunk");
+    }
+
+    #[test]
+    fn chunks_support_multiple_partial_advances() {
+        let mut chunk = Chunk::from(b"abcdef".to_vec());
+
+        assert_eq!(chunk.remaining(), 6);
+        assert_eq!(chunk.bytes(), b"abcdef");
+
+        chunk.advance(2);
+        assert_eq!(chunk.remaining(), 4);
+        assert_eq!(chunk.bytes(), b"cdef");
+
+        chunk.advance(1);
+        assert_eq!(chunk.remaining(), 3);
+        assert_eq!(chunk.bytes(), b"def");
+
+        chunk.advance(3);
+        assert_eq!(chunk.remaining(), 0);
+        assert_eq!(chunk.bytes(), b"");
+    }
+
+    #[test]
+    fn shared_chunks_copy_only_when_converted_back_to_a_vec() {
+        let shared = Arc::new(b"abcdef".to_vec());
+        let mut chunk = Chunk::shared(Arc::clone(&shared));
+        chunk.advance(2);
+
+        assert_eq!(chunk.into_vec(), b"cdef");
+        assert_eq!(shared.as_slice(), b"abcdef");
     }
 }

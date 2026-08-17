@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{IntoResponse, Response, ResponseStream, StreamError, openapi::Operation};
+use crate::{Chunk, IntoResponse, Response, ResponseStream, StreamError, openapi::Operation};
 
 pub trait SseStream {
     fn poll_next(
@@ -28,7 +28,6 @@ impl<S: SseStream + 'static> IntoResponse for Sse<S> {
             200,
             EncodedSseStream {
                 stream: self.stream,
-                current: Vec::new(),
             },
         );
         response
@@ -128,30 +127,20 @@ impl SseEvent {
 
 struct EncodedSseStream<S> {
     stream: S,
-    current: Vec<u8>,
 }
 
 impl<S: SseStream> ResponseStream for EncodedSseStream<S> {
-    fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Result<(), StreamError>>> {
+    fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Result<Chunk, StreamError>>> {
         match self.stream.poll_next(context) {
             Poll::Ready(Some(Ok(event))) => {
-                event.encode_into(&mut self.current);
-                Poll::Ready(Some(Ok(())))
+                let mut encoded = Vec::new();
+                event.encode_into(&mut encoded);
+                Poll::Ready(Some(Ok(Chunk::from(encoded))))
             }
-            Poll::Ready(Some(Err(error))) => {
-                self.current.clear();
-                Poll::Ready(Some(Err(error)))
-            }
-            Poll::Ready(None) => {
-                self.current.clear();
-                Poll::Ready(None)
-            }
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
-    }
-
-    fn chunk(&self) -> &[u8] {
-        &self.current
     }
 }
 

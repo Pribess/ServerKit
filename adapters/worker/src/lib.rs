@@ -344,7 +344,7 @@ impl Stream for WorkerResponseStream {
         context: &mut TaskContext<'_>,
     ) -> Poll<Option<Self::Item>> {
         match self.stream.poll_next(context) {
-            Poll::Ready(Some(Ok(()))) => Poll::Ready(Some(Ok(self.stream.chunk().to_vec()))),
+            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(chunk.into_vec()))),
             Poll::Ready(Some(Err(error))) => {
                 Poll::Ready(Some(Err(worker::Error::RustError(error.to_string()))))
             }
