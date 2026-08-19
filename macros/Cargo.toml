@@ -3,6 +3,8 @@ name = "serverkit-macros"
 version = "0.1.0"
 edition = "2024"
 description = "Internal procedural macros for ServerKit"
+license.workspace = true
+repository.workspace = true
 
 [lib]
 proc-macro = true

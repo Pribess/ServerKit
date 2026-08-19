@@ -3,6 +3,8 @@ name = "serverkit-hyper"
 version = "0.1.0"
 edition = "2024"
 description = "Hyper HTTP/1 and HTTP/2 adapter for ServerKit"
+license.workspace = true
+repository.workspace = true
 
 [features]
 default = []

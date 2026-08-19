@@ -3,6 +3,8 @@ name = "serverkit-worker"
 version = "0.1.0"
 edition = "2024"
 description = "Cloudflare Workers adapter for ServerKit"
+license.workspace = true
+repository.workspace = true
 
 [features]
 default = []
