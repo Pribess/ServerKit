@@ -1,6 +1,6 @@
 [package]
 name = "serverkit"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A portable Rust HTTP application layer for Workers and native servers"
 readme = "README.md"
@@ -23,7 +23,7 @@ websocket = []
 [dependencies]
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
-serverkit-macros = { version = "0.1.0", path = "macros" }
+serverkit-macros = { version = "0.2.0", path = "macros" }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -9,12 +9,13 @@ routes, handlers, and extractors to Cloudflare Workers.
 
 ```toml
 [dependencies]
-serverkit = { version = "0.1", features = ["json", "websocket"] }
+serverkit = { version = "0.2", features = ["json", "websocket"] }
 serde = { version = "1", features = ["derive"] }
-serverkit-hyper = { version = "0.1", features = ["websocket"] }
+serverkit-hyper = { version = "0.2", features = ["tokio", "websocket"] }
+tokio = { version = "1", features = ["net", "rt"] }
 
 # Use these instead of serverkit-hyper on Cloudflare Workers.
-serverkit-worker = { version = "0.1", features = ["websocket"] }
+serverkit-worker = { version = "0.2", features = ["websocket"] }
 worker = "0.8.5"
 ```
 
@@ -27,8 +28,7 @@ The same `Schema` derive decodes and validates path parameters, query
 parameters, and headers by name.
 
 ```rust,ignore
-use serverkit::prelude::*;
-use serverkit_hyper::Http;
+use serverkit_hyper::*;
 
 #[derive(Schema)]
 struct UserPath {
@@ -72,18 +72,26 @@ async fn get_user(
 }
 
 fn main() -> std::io::Result<()> {
-    let router = Router::new(Config::new(), (
-        "/health".GET(health),
-        "/:organization/users/:id".GET(get_user),
-    ));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()?;
 
-    router.run(Http::bind("127.0.0.1:3000")?)
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+        let router = Router::new(Config::new(), (
+            "/health".GET(health),
+            "/:organization/users/:id".GET(get_user),
+        ));
+
+        router.run(listener).await
+    })
 }
 ```
 
-`Http` automatically detects HTTP/1.0, HTTP/1.1, and HTTP/2 after accepting a
-connection. TLS and HTTP/3 are separate transport concerns and are not provided
-by this adapter.
+The `tokio` driver automatically detects HTTP/1.0, HTTP/1.1, and HTTP/2 after
+accepting a connection. It uses the caller's Tokio runtime and listener rather
+than creating either one. TLS and HTTP/3 are separate transport concerns and
+are not provided by this adapter.
 
 `Router::new` accepts one route or a convenience tuple. `.route()` can then be
 called any number of times, so the number of routes in a router is not
@@ -1256,33 +1264,29 @@ let _example = ExampleValue::object([
 Pass an `ExampleValue` to `Operation::request_example` or
 `Operation::response_example`. String inputs remain accepted directly.
 
-## Listener adapters
+## Runtime adapters
 
-`Router::run` dispatches to the `Listener` implementation of the value passed by
-the user. `serverkit_hyper::Http` owns a `std::net::TcpListener`, automatically
-serves HTTP/1.0, HTTP/1.1, or HTTP/2, and implements that trait. Other runtimes
-can expose their own local wrapper type and implement the same trait.
+The core `serverkit` crate ends at `Router::handle` and does not depend on a
+listener or async runtime. `serverkit-hyper` adds its own `Run<L>` extension
+trait and re-exports the core prelude, so one import exposes both the framework
+API and `.run(listener)`:
 
-```rust
-use serverkit::{Config, Listener, Router};
+```rust,ignore
+use serverkit_hyper::*;
 
-struct TestListener;
+let listener = std::net::TcpListener::bind("127.0.0.1:3000")?;
+let router = Router::new(Config::new(), "/health".GET(|| async { "ok" }));
 
-impl Listener for TestListener {
-    type Output = (Router, &'static str);
-
-    fn serve(self, router: Router) -> Self::Output {
-        (router, "ready")
-    }
-}
-
-let router = Router::new(Config::new(), ());
-let (_router, state) = router.run(TestListener);
-
-assert_eq!(state, "ready");
+router.run(listener)?;
 ```
 
-The routing and extraction layer remains independent of the listener and
-request-stream adapter used by a native runtime or Worker host. An external
-adapter implements `RequestStream`, constructs `Request::from_parts`, calls
-`Router::handle`, and consumes the result with `Response::into_parts`.
+Enable `serverkit-hyper/std` to pass a `std::net::TcpListener`. This blocking
+driver serves HTTP/1.0 and HTTP/1.1 without a Tokio runtime. Enable
+`serverkit-hyper/tokio` to pass a `tokio::net::TcpListener`; this driver serves
+HTTP/1.0, HTTP/1.1, and HTTP/2 on the caller's Tokio runtime. The `websocket`
+feature selects the Tokio driver because upgrades need its asynchronous I/O.
+
+An external adapter follows the same boundary: implement `RequestStream`,
+construct `Request::from_parts`, call `Router::handle`, and consume the result
+with `Response::into_parts`. The adapter can expose its own execution extension
+trait without adding runtime types to the core crate.

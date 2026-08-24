@@ -1,6 +1,6 @@
 [package]
 name = "serverkit-hyper"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Hyper HTTP/1 and HTTP/2 adapter for ServerKit"
 license.workspace = true
@@ -8,13 +8,22 @@ repository.workspace = true
 
 [features]
 default = []
-websocket = ["serverkit/websocket", "dep:futures-util", "dep:tokio-tungstenite"]
+std = ["dep:async-io", "dep:hyper", "hyper/http1"]
+tokio = [
+    "dep:hyper",
+    "hyper/http1",
+    "hyper/http2",
+    "dep:hyper-util",
+    "dep:tokio",
+]
+websocket = ["tokio", "serverkit/websocket", "dep:futures-util", "dep:tokio-tungstenite"]
 
 [dependencies]
-serverkit = { version = "0.1.0", path = "../.." }
-hyper = { version = "1", features = ["server"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
-tokio = { version = "1", features = ["net", "rt"] }
+serverkit = { version = "0.2.0", path = "../.." }
+async-io = { version = "2", optional = true }
+hyper = { version = "1", features = ["server"], optional = true }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"], optional = true }
+tokio = { version = "1", features = ["net", "rt"], optional = true }
 futures-util = { version = "0.3", features = ["sink"], optional = true }
 tokio-tungstenite = { version = "0.29", optional = true }
 
@@ -22,3 +31,11 @@ tokio-tungstenite = { version = "0.29", optional = true }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client"] }
 tokio = { version = "1", features = ["io-util", "net", "rt"] }
+
+[[example]]
+name = "server"
+required-features = ["tokio"]
+
+[[example]]
+name = "std_server"
+required-features = ["std"]

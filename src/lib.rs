@@ -9,7 +9,6 @@ mod body;
 mod cookie;
 mod extract;
 mod handler;
-mod listener;
 mod middleware;
 mod multipart;
 pub mod openapi;
@@ -40,8 +39,6 @@ pub use extract::{
 pub use extract::{Json, JsonError};
 
 pub use handler::Handler;
-
-pub use listener::Listener;
 
 pub use middleware::{Middleware, Next};
 
@@ -90,13 +87,12 @@ pub mod adapter {
 pub mod prelude {
     pub use crate::{
         ApiKeyLocation, Body, Chunk, Config, DecodeOptions, ExampleValue, ExtraFields, FromRequest,
-        Handler, Header, HeaderError, Headers, IntoResponse, Listener, Method, Middleware, Next,
-        OAuthFlow, OAuthFlows, OpenApi, OpenApiDocument, Operation, ParameterLocation, Path,
-        PathError, Query, QueryError, Request, RequestStream, Response, ResponseBody,
-        ResponseStream, Route, RouteMethods, Router, Scalar, ScalarDeveloperTools, Schema,
-        SchemaField, SchemaKind, SchemaMetadata, SecurityRequirement, SecurityScheme, Server,
-        StreamError, UnknownFields, ValidationErrors, ValidationIssue, ValidationRule, Value,
-        ValueSchema, Values,
+        Handler, Header, HeaderError, Headers, IntoResponse, Method, Middleware, Next, OAuthFlow,
+        OAuthFlows, OpenApi, OpenApiDocument, Operation, ParameterLocation, Path, PathError, Query,
+        QueryError, Request, RequestStream, Response, ResponseBody, ResponseStream, Route,
+        RouteMethods, Router, Scalar, ScalarDeveloperTools, Schema, SchemaField, SchemaKind,
+        SchemaMetadata, SecurityRequirement, SecurityScheme, Server, StreamError, UnknownFields,
+        ValidationErrors, ValidationIssue, ValidationRule, Value, ValueSchema, Values,
     };
 
     pub use crate::{

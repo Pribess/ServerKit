@@ -1,8 +1,8 @@
 use std::{any::TypeId, collections::HashMap};
 
 use crate::{
-    Dispatch, Dispatcher, Handler, Listener, Middleware, OpenApi, OpenApiDocument, Request,
-    Response, Routes, Scope,
+    Dispatch, Dispatcher, Handler, Middleware, OpenApi, OpenApiDocument, Request, Response, Routes,
+    Scope,
     middleware::{MiddlewareEntry, MiddlewareTerminal, run as run_middleware},
     router::{join_paths, validate_scope_prefix},
 };
@@ -142,10 +142,6 @@ impl Router {
 
     pub fn openapi_document(&self) -> Option<&OpenApiDocument> {
         self.openapi.as_ref().map(|published| &published.document)
-    }
-
-    pub fn run<L: Listener>(self, listener: L) -> L::Output {
-        listener.serve(self)
     }
 
     pub async fn handle(&self, mut request: Request) -> Response {
