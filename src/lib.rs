@@ -7,6 +7,7 @@ extern crate self as serverkit;
 mod app;
 mod body;
 mod cookie;
+mod error;
 mod extract;
 mod handler;
 mod middleware;
@@ -28,6 +29,8 @@ pub use app::{Config, Router};
 pub use body::Body;
 
 pub use cookie::{Cookie, Cookies, SameSite};
+
+pub use error::{ErrorFormat, HttpError};
 
 pub use extract::{
     Bytes, ConnectInfo, Extension, Form, FormError, FromRequest, Header, HeaderError,
@@ -86,13 +89,14 @@ pub mod adapter {
 
 pub mod prelude {
     pub use crate::{
-        ApiKeyLocation, Body, Chunk, Config, DecodeOptions, ExampleValue, ExtraFields, FromRequest,
-        Handler, Header, HeaderError, Headers, IntoResponse, Method, Middleware, Next, OAuthFlow,
-        OAuthFlows, OpenApi, OpenApiDocument, Operation, ParameterLocation, Path, PathError, Query,
-        QueryError, Request, RequestStream, Response, ResponseBody, ResponseStream, Route,
-        RouteMethods, Router, Scalar, ScalarDeveloperTools, Schema, SchemaField, SchemaKind,
-        SchemaMetadata, SecurityRequirement, SecurityScheme, Server, StreamError, UnknownFields,
-        ValidationErrors, ValidationIssue, ValidationRule, Value, ValueSchema, Values,
+        ApiKeyLocation, Body, Chunk, Config, DecodeOptions, ErrorFormat, ExampleValue, ExtraFields,
+        FromRequest, Handler, Header, HeaderError, Headers, HttpError, IntoResponse, Method,
+        Middleware, Next, OAuthFlow, OAuthFlows, OpenApi, OpenApiDocument, Operation,
+        ParameterLocation, Path, PathError, Query, QueryError, Request, RequestStream, Response,
+        ResponseBody, ResponseStream, Route, RouteMethods, Router, Scalar, ScalarDeveloperTools,
+        Schema, SchemaField, SchemaKind, SchemaMetadata, SecurityRequirement, SecurityScheme,
+        Server, StreamError, UnknownFields, ValidationErrors, ValidationIssue, ValidationRule,
+        Value, ValueSchema, Values,
     };
 
     pub use crate::{

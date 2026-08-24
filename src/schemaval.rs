@@ -279,10 +279,28 @@ pub enum ValidationRule {
     Custom,
 }
 
+impl ValidationRule {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::UnknownField => "unknown_field",
+            Self::Multiple => "multiple",
+            Self::InvalidEncoding => "invalid_encoding",
+            Self::InvalidType => "invalid_type",
+            Self::Minimum => "minimum",
+            Self::Maximum => "maximum",
+            Self::MinimumLength => "minimum_length",
+            Self::MaximumLength => "maximum_length",
+            Self::Custom => "custom",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationIssue {
     field: Option<String>,
     rule: ValidationRule,
+    code: Option<String>,
     message: String,
 }
 
@@ -291,6 +309,16 @@ impl ValidationIssue {
         Self {
             field: None,
             rule: ValidationRule::Custom,
+            code: None,
+            message: message.into(),
+        }
+    }
+
+    pub fn coded(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            field: None,
+            rule: ValidationRule::Custom,
+            code: Some(code.into()),
             message: message.into(),
         }
     }
@@ -301,6 +329,10 @@ impl ValidationIssue {
 
     pub fn rule(&self) -> ValidationRule {
         self.rule
+    }
+
+    pub fn code(&self) -> &str {
+        self.code.as_deref().unwrap_or(self.rule.as_str())
     }
 
     pub fn message(&self) -> &str {
@@ -315,6 +347,7 @@ impl ValidationIssue {
         Self {
             field: field.map(Into::into),
             rule,
+            code: None,
             message: message.into(),
         }
     }
@@ -400,7 +433,13 @@ impl fmt::Display for ValidationErrors {
 
 impl IntoResponse for ValidationErrors {
     fn into_response(self) -> Response {
-        Response::error(400, self.to_string())
+        crate::HttpError::new(
+            400,
+            "request.validation.invalid",
+            "Request validation failed",
+        )
+        .validation(self)
+        .into_response()
     }
 }
 

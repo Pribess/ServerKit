@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{IntoResponse, RequestStream, Response};
+use crate::{HttpError, IntoResponse, RequestStream, Response};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Method(MethodRepr);
@@ -291,6 +291,16 @@ impl Headers {
         self.remove(&name);
         self.entries.push((name, value.into()));
     }
+
+    pub(crate) fn merge_from(&mut self, headers: Self) {
+        self.entries.retain(|(existing, _)| {
+            !headers
+                .entries
+                .iter()
+                .any(|(incoming, _)| existing.eq_ignore_ascii_case(incoming))
+        });
+        self.entries.extend(headers.entries);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,7 +322,7 @@ impl fmt::Display for InvalidHeader {
 
 impl IntoResponse for InvalidHeader {
     fn into_response(self) -> Response {
-        Response::error(500, self.message)
+        HttpError::new(500, "response.header.invalid", self.message).into_response()
     }
 }
 

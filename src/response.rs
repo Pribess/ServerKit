@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 
 use crate::{
-    Cookie, Headers, InvalidHeader, ResponseStream,
+    Cookie, Headers, HttpError, InvalidHeader, ResponseStream,
     openapi::Operation,
     schemaval::{SchemaKind, SchemaMetadata},
 };
@@ -35,6 +35,7 @@ pub struct Response {
     status: u16,
     headers: Headers,
     body: ResponseBody,
+    error: Option<HttpError>,
 }
 
 impl Response {
@@ -43,6 +44,7 @@ impl Response {
             status,
             headers: Headers::new(),
             body: ResponseBody::Buffered(Vec::new()),
+            error: None,
         }
     }
 
@@ -55,6 +57,7 @@ impl Response {
             status,
             headers: Headers::new(),
             body: ResponseBody::Buffered(text.into().into_bytes()),
+            error: None,
         };
         response
             .headers
@@ -67,6 +70,7 @@ impl Response {
             status,
             headers: Headers::new(),
             body: ResponseBody::Buffered(bytes.into()),
+            error: None,
         };
         response
             .headers
@@ -79,6 +83,7 @@ impl Response {
             status,
             headers: Headers::new(),
             body: ResponseBody::Streaming(Box::new(stream)),
+            error: None,
         }
     }
 
@@ -89,6 +94,7 @@ impl Response {
             status: 101,
             headers: Headers::new(),
             body: ResponseBody::WebSocket(plan),
+            error: None,
         };
 
         if let Some(protocol) = selected_protocol {
@@ -100,8 +106,15 @@ impl Response {
         response
     }
 
-    pub(crate) fn error(status: u16, message: impl Into<String>) -> Self {
-        Self::text(status, message)
+    pub(crate) fn pending_error(mut error: HttpError) -> Self {
+        let headers = error.take_headers();
+
+        Self {
+            status: error.status(),
+            headers,
+            body: ResponseBody::Buffered(Vec::new()),
+            error: Some(error),
+        }
     }
 
     pub fn status(&self) -> u16 {
@@ -135,12 +148,35 @@ impl Response {
     }
 
     pub(crate) fn without_body(mut self) -> Self {
-        if let ResponseBody::Buffered(body) = &mut self.body {
-            let content_length = body.len().to_string();
-            body.clear();
-            self.set_header("Content-Length", content_length);
+        match &mut self.body {
+            ResponseBody::Buffered(body) => {
+                let content_length = body.len().to_string();
+                body.clear();
+                self.set_header("Content-Length", content_length);
+            }
+            ResponseBody::Streaming(_) => {
+                self.body = ResponseBody::Buffered(Vec::new());
+            }
+            #[cfg(feature = "websocket")]
+            ResponseBody::WebSocket(_) => {}
         }
         self
+    }
+
+    pub(crate) fn take_error(&mut self) -> Option<HttpError> {
+        self.error.take()
+    }
+
+    pub(crate) fn set_status(&mut self, status: u16) {
+        self.status = status;
+    }
+
+    pub(crate) fn take_headers(&mut self) -> Headers {
+        std::mem::take(&mut self.headers)
+    }
+
+    pub(crate) fn merge_headers(&mut self, headers: Headers) {
+        self.headers.merge_from(headers);
     }
 
     pub fn into_parts(self) -> (u16, Headers, ResponseBody) {

@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{IntoResponse, Response};
+use crate::{HttpError, IntoResponse, Response};
 
 pub trait RequestStream {
     /// Advances to the next chunk without transferring its allocation.
@@ -101,6 +101,7 @@ pub trait ResponseStream {
 #[derive(Debug)]
 pub struct StreamError {
     status: u16,
+    code: &'static str,
     message: String,
 }
 
@@ -108,6 +109,7 @@ impl StreamError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             status: 400,
+            code: "request.body.invalid",
             message: message.into(),
         }
     }
@@ -115,6 +117,7 @@ impl StreamError {
     pub fn payload_too_large(limit: usize) -> Self {
         Self {
             status: 413,
+            code: "request.body.too_large",
             message: format!("request body exceeds the {limit}-byte limit"),
         }
     }
@@ -134,7 +137,7 @@ impl std::error::Error for StreamError {}
 
 impl IntoResponse for StreamError {
     fn into_response(self) -> Response {
-        Response::error(self.status, self.message)
+        HttpError::new(self.status, self.code, self.message).into_response()
     }
 }
 

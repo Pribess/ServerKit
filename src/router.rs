@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    Handler, Method, Request, Response,
+    Handler, HttpError, IntoResponse, Method, Request, Response,
     middleware::{MiddlewareEntry, MiddlewareFuture, MiddlewareTerminal},
     openapi::{Operation, RouteDescription},
 };
@@ -469,7 +469,6 @@ impl Dispatcher {
                 return Dispatch::Route {
                     route,
                     captures,
-                    head: false,
                     allow: Some(allow),
                 };
             }
@@ -492,7 +491,6 @@ impl Dispatcher {
         Dispatch::Route {
             route,
             captures,
-            head: is_head,
             allow: None,
         }
     }
@@ -561,7 +559,6 @@ pub(crate) enum Dispatch<'dispatcher> {
     Route {
         route: &'dispatcher RegisteredRoute,
         captures: Vec<(String, String)>,
-        head: bool,
         allow: Option<String>,
     },
     Fallback(&'dispatcher RegisteredFallback),
@@ -597,7 +594,6 @@ impl MiddlewareTerminal for Dispatch<'_> {
                 Self::Route {
                     route,
                     captures,
-                    head,
                     allow,
                 } => {
                     request.set_params(captures.clone());
@@ -607,18 +603,20 @@ impl MiddlewareTerminal for Dispatch<'_> {
                         response.set_header("Allow", allow.clone());
                     }
 
-                    if *head {
-                        response.without_body()
-                    } else {
-                        response
-                    }
+                    response
                 }
                 Self::Fallback(fallback) => fallback.handler.call(request).await,
-                Self::NotFound => Response::text(404, "Not Found"),
+                Self::NotFound => {
+                    HttpError::new(404, "route.not_found", "Not Found").into_response()
+                }
                 Self::MethodNotAllowed { allow } => {
-                    let mut response = Response::text(405, "Method Not Allowed");
-                    response.set_header("Allow", allow.clone());
-                    response
+                    let mut error =
+                        HttpError::new(405, "route.method_not_allowed", "Method Not Allowed");
+                    error
+                        .headers()
+                        .set("Allow", allow.clone())
+                        .expect("a generated Allow header is valid");
+                    error.into_response()
                 }
                 Self::Options { allow } => {
                     let mut response = Response::empty();
@@ -941,7 +939,11 @@ mod tests {
         let response = block_on(application.handle(request("/missing")));
 
         assert_eq!(response.status(), 404);
-        assert_eq!(response.body(), b"Not Found");
+        assert_eq!(response.content_type(), Some("application/json"));
+        assert_eq!(
+            response.body(),
+            br#"{"error":{"code":"route.not_found","message":"Not Found","fields":[]}}"#,
+        );
     }
 
     #[test]
@@ -1096,7 +1098,17 @@ mod tests {
             headers.get("allow"),
             Some(b"GET, HEAD, POST, OPTIONS".as_slice())
         );
-        assert_eq!(body.buffered(), Some(b"Method Not Allowed".as_slice()));
+        assert_eq!(
+            headers.get("content-type"),
+            Some(b"application/json".as_slice())
+        );
+        assert_eq!(
+            body.buffered(),
+            Some(
+                br#"{"error":{"code":"route.method_not_allowed","message":"Method Not Allowed","fields":[]}}"#
+                    .as_slice(),
+            ),
+        );
     }
 
     #[test]

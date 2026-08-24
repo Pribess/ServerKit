@@ -9,13 +9,13 @@ routes, handlers, and extractors to Cloudflare Workers.
 
 ```toml
 [dependencies]
-serverkit = { version = "0.2", features = ["json", "websocket"] }
+serverkit = { version = "0.3", features = ["json", "websocket"] }
 serde = { version = "1", features = ["derive"] }
-serverkit-hyper = { version = "0.2", features = ["tokio", "websocket"] }
+serverkit-hyper = { version = "0.3", features = ["tokio", "websocket"] }
 tokio = { version = "1", features = ["net", "rt"] }
 
 # Use these instead of serverkit-hyper on Cloudflare Workers.
-serverkit-worker = { version = "0.2", features = ["websocket"] }
+serverkit-worker = { version = "0.3", features = ["websocket"] }
 worker = "0.8.5"
 ```
 
@@ -505,8 +505,22 @@ Direct `Schema::decode` calls accept `DecodeOptions::reject_unknown()` or
 and apply `#[schema(unknown_fields = "...")]` when it is present.
 
 Failures are aggregated in `ValidationErrors`. Each `ValidationIssue` exposes
-its optional field name, `ValidationRule`, and message. Extractors convert
-validation failures into HTTP 400 responses.
+its optional field name, stable code, `ValidationRule`, and message. Use
+`ValidationIssue::coded` when a custom validator needs an application-specific
+code. Extractors preserve validation failures in the router's `HttpError`.
+
+```rust
+use serverkit::ValidationIssue;
+
+fn validate_name(name: &String) -> Result<(), ValidationIssue> {
+    (!name.trim().is_empty())
+        .then_some(())
+        .ok_or_else(|| ValidationIssue::coded(
+            "name.empty",
+            "name must not be empty",
+        ))
+}
+```
 
 Custom value sources can implement `Values` and call the same schema directly.
 
@@ -547,6 +561,64 @@ let identifier = Identifier::decode(
 
 assert_eq!(identifier.id, 42);
 ```
+
+## Error responses
+
+Every request-time error is represented as an `HttpError` until middleware has
+finished. `Router::handle` then renders it once. The default renderer is a
+dependency-free JSON envelope, including when the `json` feature is disabled:
+
+```json
+{
+  "error": {
+    "code": "route.not_found",
+    "message": "Not Found",
+    "fields": []
+  }
+}
+```
+
+Path, query, header, and form validation errors populate `fields` from the
+original Schemaval issues. Each field contains `field`, `code`, and `message`;
+`field` is `null` for a request-wide issue.
+
+Application handlers return their own stable status, code, and public message:
+
+```rust
+use serverkit::HttpError;
+
+# async fn find_user() -> Option<String> { None }
+async fn user() -> Result<String, HttpError> {
+    find_user()
+        .await
+        .ok_or_else(|| HttpError::new(
+            404,
+            "user.not_found",
+            "User does not exist",
+        ))
+}
+```
+
+Configure a different representation once for the whole router. The formatter
+chooses the body and representation headers; ServerKit preserves the original
+status and protocol headers such as `Allow` and `WWW-Authenticate`.
+
+```rust
+use serverkit::{Config, HttpError, Response};
+
+let config = Config::new().error_format(|error: &HttpError| {
+    Response::text(
+        error.status(),
+        format!("{}: {}", error.code(), error.message()),
+    )
+});
+```
+
+Raw 4xx and 5xx `Response` values are normalized through the same formatter
+with the fallback code `http.{status}`. When routers are nested, the outer
+router owns the final error format, keeping one response contract across the
+composed application. Errors after an HTTP response stream starts or after a
+WebSocket upgrade cannot be rendered as a new HTTP response.
 
 Enums decode from their external string representation. All common rename
 rules are supported: `lowercase`, `UPPERCASE`, `camelCase`, `PascalCase`,
@@ -906,12 +978,12 @@ Set `BUFFERED` only when the extractor needs the complete body; otherwise the
 slice is empty and the runtime stream remains untouched.
 
 ```rust
-use serverkit::{FromRequest, Request, Response};
+use serverkit::{FromRequest, HttpError, Request};
 
 struct UserAgent(String);
 
 impl<'request> FromRequest<(&'request Request, &'request [u8])> for UserAgent {
-    type Error = Response;
+    type Error = HttpError;
 
     async fn from_request(
         input: (&'request Request, &'request [u8]),
@@ -920,9 +992,17 @@ impl<'request> FromRequest<(&'request Request, &'request [u8])> for UserAgent {
             .0
             .headers
             .get("user-agent")
-            .ok_or_else(|| Response::text(400, "missing user-agent"))?;
+            .ok_or_else(|| HttpError::new(
+                400,
+                "request.user_agent.missing",
+                "missing user-agent",
+            ))?;
         let value = std::str::from_utf8(value)
-            .map_err(|_| Response::text(400, "invalid user-agent"))?;
+            .map_err(|_| HttpError::new(
+                400,
+                "request.user_agent.invalid",
+                "invalid user-agent",
+            ))?;
 
         Ok(Self(value.to_owned()))
     }

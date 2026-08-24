@@ -4,8 +4,8 @@ use std::{convert::Infallible, marker::PhantomData, sync::Arc};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
-    Body, Cookies, DecodeOptions, IntoResponse, Method, Request, Response, Schema, UnknownFields,
-    ValidationErrors, ValidationIssue, ValidationRule, Value, Values,
+    Body, Cookies, DecodeOptions, HttpError, IntoResponse, Method, Request, Response, Schema,
+    UnknownFields, ValidationErrors, ValidationIssue, ValidationRule, Value, Values,
     openapi::{Operation, ParameterLocation},
     schemaval::{SchemaKind, SchemaMetadata},
 };
@@ -63,18 +63,30 @@ pub struct MissingExtension<T>(PhantomData<fn() -> T>);
 pub struct MissingConnectInfo<T>(PhantomData<fn() -> T>);
 
 macro_rules! missing_value {
-    ($type:ident, $message:literal) => {
+    ($type:ident, $code:literal, $message:literal) => {
         impl<T> IntoResponse for $type<T> {
             fn into_response(self) -> Response {
-                Response::error(500, $message)
+                HttpError::new(500, $code, $message).into_response()
             }
         }
     };
 }
 
-missing_value!(MissingState, "application state is unavailable");
-missing_value!(MissingExtension, "request extension is unavailable");
-missing_value!(MissingConnectInfo, "connection information is unavailable");
+missing_value!(
+    MissingState,
+    "application.state.unavailable",
+    "application state is unavailable"
+);
+missing_value!(
+    MissingExtension,
+    "application.extension.unavailable",
+    "request extension is unavailable"
+);
+missing_value!(
+    MissingConnectInfo,
+    "application.connect_info.unavailable",
+    "connection information is unavailable"
+);
 
 impl<'request, T: Send + Sync + 'static> FromRequest<(&'request Request, &'request [u8])>
     for State<T>
@@ -148,7 +160,12 @@ pub struct TextError;
 
 impl IntoResponse for TextError {
     fn into_response(self) -> Response {
-        Response::error(400, "request body must be valid UTF-8")
+        HttpError::new(
+            400,
+            "request.text.invalid",
+            "request body must be valid UTF-8",
+        )
+        .into_response()
     }
 }
 
@@ -185,13 +202,20 @@ pub enum FormError {
 impl IntoResponse for FormError {
     fn into_response(self) -> Response {
         match self {
-            Self::ContentType => Response::error(
+            Self::ContentType => HttpError::new(
                 415,
+                "request.content_type.unsupported",
                 "expected application/x-www-form-urlencoded request body",
             ),
-            Self::Encoding => Response::error(400, "form body must be valid UTF-8"),
-            Self::Validation(errors) => errors.into_response(),
+            Self::Encoding => {
+                HttpError::new(400, "request.form.invalid", "form body must be valid UTF-8")
+            }
+            Self::Validation(errors) => {
+                HttpError::new(400, "request.form.invalid", "Invalid form request body")
+                    .validation(errors)
+            }
         }
+        .into_response()
     }
 }
 
@@ -246,18 +270,28 @@ pub struct QueryError(pub ValidationErrors);
 pub struct HeaderError(pub ValidationErrors);
 
 macro_rules! extractor_error {
-    ($type:ty) => {
+    ($type:ty, $code:literal, $message:literal) => {
         impl IntoResponse for $type {
             fn into_response(self) -> Response {
-                self.0.into_response()
+                HttpError::new(400, $code, $message)
+                    .validation(self.0)
+                    .into_response()
             }
         }
     };
 }
 
-extractor_error!(PathError);
-extractor_error!(QueryError);
-extractor_error!(HeaderError);
+extractor_error!(PathError, "request.path.invalid", "Invalid path parameters");
+extractor_error!(
+    QueryError,
+    "request.query.invalid",
+    "Invalid query parameters"
+);
+extractor_error!(
+    HeaderError,
+    "request.header.invalid",
+    "Invalid request headers"
+);
 
 impl<'request, T: Schema> FromRequest<(&'request Request, &'request [u8])> for Path<T> {
     type Error = PathError;
@@ -496,9 +530,16 @@ pub enum JsonError {
 impl IntoResponse for JsonError {
     fn into_response(self) -> Response {
         match self {
-            Self::ContentType => Response::error(415, "expected application/json request body"),
-            Self::Deserialize(error) => Response::error(400, error.to_string()),
+            Self::ContentType => HttpError::new(
+                415,
+                "request.content_type.unsupported",
+                "expected application/json request body",
+            ),
+            Self::Deserialize(error) => {
+                HttpError::new(400, "request.json.invalid", error.to_string())
+            }
         }
+        .into_response()
     }
 }
 
@@ -544,7 +585,10 @@ impl<T: Serialize + Schema> IntoResponse for Json<T> {
                 response.set_header("Content-Type", "application/json");
                 response
             }
-            Err(error) => Response::error(500, error.to_string()),
+            Err(error) => {
+                HttpError::new(500, "response.json.serialization_failed", error.to_string())
+                    .into_response()
+            }
         }
     }
 
@@ -587,7 +631,7 @@ mod tests {
             .chars()
             .all(|character| character.is_ascii_lowercase() || character == '-')
             .then_some(())
-            .ok_or_else(|| ValidationIssue::custom("must be a lowercase slug"))
+            .ok_or_else(|| ValidationIssue::coded("slug.lowercase", "must be a lowercase slug"))
     }
 
     #[derive(Debug, PartialEq, crate::Schema)]
@@ -679,6 +723,7 @@ mod tests {
 
         assert_eq!(errors.issues()[0].field(), Some("slug"));
         assert_eq!(errors.issues()[0].rule(), ValidationRule::Custom);
+        assert_eq!(errors.issues()[0].code(), "slug.lowercase");
     }
 
     #[test]

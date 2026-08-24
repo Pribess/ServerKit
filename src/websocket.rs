@@ -5,7 +5,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{FromRequest, IntoResponse, Request, Response, openapi::Operation};
+use crate::{FromRequest, HttpError, IntoResponse, Request, Response, openapi::Operation};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebSocketMessage {
@@ -43,7 +43,7 @@ impl std::error::Error for WebSocketError {}
 
 impl IntoResponse for WebSocketError {
     fn into_response(self) -> Response {
-        Response::error(500, self.message)
+        HttpError::new(500, "websocket.io.failed", self.message).into_response()
     }
 }
 
@@ -166,14 +166,34 @@ pub enum WebSocketUpgradeError {
 impl IntoResponse for WebSocketUpgradeError {
     fn into_response(self) -> Response {
         match self {
-            Self::NotWebSocket => Response::error(400, "request is not a WebSocket upgrade"),
+            Self::NotWebSocket => HttpError::new(
+                400,
+                "websocket.upgrade.invalid",
+                "request is not a WebSocket upgrade",
+            )
+            .into_response(),
             Self::Version => {
-                let mut response = Response::error(426, "unsupported WebSocket version");
-                response.set_header("Sec-WebSocket-Version", "13");
-                response
+                let mut error = HttpError::new(
+                    426,
+                    "websocket.version.unsupported",
+                    "unsupported WebSocket version",
+                );
+                error
+                    .headers()
+                    .set("Sec-WebSocket-Version", "13")
+                    .expect("the built-in WebSocket version header is valid");
+                error.into_response()
             }
-            Self::MissingKey => Response::error(400, "WebSocket key is missing"),
-            Self::Protocol => Response::error(400, "WebSocket protocol was not requested"),
+            Self::MissingKey => {
+                HttpError::new(400, "websocket.key.missing", "WebSocket key is missing")
+                    .into_response()
+            }
+            Self::Protocol => HttpError::new(
+                400,
+                "websocket.protocol.invalid",
+                "WebSocket protocol was not requested",
+            )
+            .into_response(),
         }
     }
 }
