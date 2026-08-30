@@ -1,7 +1,7 @@
 use std::{any::TypeId, collections::HashMap, fmt, sync::Arc};
 
 use crate::{
-    Dispatch, Dispatcher, ErrorFormat, Handler, HttpError, IntoResponse, Middleware, OpenApi,
+    Dispatch, Dispatcher, Error, ErrorFormat, Handler, IntoResponse, Middleware, OpenApi,
     OpenApiDocument, Request, Response, Routes, Scope,
     error::JsonErrorFormat,
     middleware::{MiddlewareEntry, MiddlewareTerminal, run as run_middleware},
@@ -221,22 +221,32 @@ impl Router {
     }
 
     fn finalize_error(&self, mut response: Response) -> Response {
-        let error = match response.take_error() {
-            Some(error) => error,
-            None if (400..=599).contains(&response.status()) => HttpError::new(
-                response.status(),
-                format!("http.{}", response.status()),
-                response_error_message(&response),
+        let (error, validation) = match response.take_error() {
+            Some(error) => error.into_parts(),
+            None if (400..=599).contains(&response.status()) => (
+                Error::new(
+                    response.status(),
+                    format!("http.{}", response.status()),
+                    response_error_message(&response),
+                ),
+                None,
             ),
             None => return response,
         };
         let status = error.status();
         let mut headers = response.take_headers();
         remove_representation_headers(&mut headers);
-        let mut formatted = self.error_format.format(&error);
+        let mut formatted = match validation.as_ref() {
+            Some(validation) => self.error_format.format_validation(&error, validation),
+            None => self.error_format.format(&error),
+        };
 
         if let Some(format_error) = formatted.take_error() {
-            formatted = JsonErrorFormat.format(&format_error);
+            let (format_error, format_validation) = format_error.into_parts();
+            formatted = match format_validation.as_ref() {
+                Some(validation) => JsonErrorFormat.format_validation(&format_error, validation),
+                None => JsonErrorFormat.format(&format_error),
+            };
         }
 
         formatted.set_status(status);
@@ -386,7 +396,7 @@ impl MiddlewareTerminal for RouterTerminal<'_> {
                         "GET" => response,
                         "HEAD" => response,
                         "OPTIONS" => Response::empty(),
-                        _ => HttpError::new(405, "route.method_not_allowed", "Method Not Allowed")
+                        _ => Error::new(405, "route.method_not_allowed", "Method Not Allowed")
                             .into_response(),
                     };
                     response.set_header("Allow", "GET, HEAD, OPTIONS");
@@ -401,12 +411,14 @@ impl MiddlewareTerminal for RouterTerminal<'_> {
 #[cfg(test)]
 mod tests {
     use std::{
+        error::Error as StdError,
+        fmt,
         future::Future,
         task::{Context, Poll, Waker},
     };
 
     use crate::{
-        Config, Form, Headers, HttpError, Method, Middleware, Next, OpenApi, Path, Query, Request,
+        Config, Error, Form, Headers, Method, Middleware, Next, OpenApi, Path, Query, Request,
         RequestStream, Response, RouteMethods, Router, StreamError,
     };
 
@@ -456,12 +468,27 @@ mod tests {
         item.name
     }
 
-    async fn failure() -> Result<&'static str, HttpError> {
-        Err(HttpError::new(
+    async fn failure() -> Result<&'static str, Error> {
+        Err(Error::new(
             409,
             "sample.failed",
             "The sample operation failed",
         ))
+    }
+
+    #[derive(Debug)]
+    struct DatabaseError;
+
+    impl fmt::Display for DatabaseError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("database connection lost")
+        }
+    }
+
+    impl StdError for DatabaseError {}
+
+    async fn internal_failure() -> Result<&'static str, Error> {
+        Err(DatabaseError)?
     }
 
     async fn raw_error() -> Response {
@@ -550,7 +577,7 @@ mod tests {
     #[test]
     fn applies_one_custom_error_format_and_preserves_http_semantics() {
         let application = Router::new(
-            Config::new().error_format(|error: &HttpError| {
+            Config::new().error_format(|error: &Error| {
                 Response::text(200, format!("{}:{}", error.code(), error.message()))
             }),
             "/failure".GET(failure),
@@ -568,6 +595,26 @@ mod tests {
             response.body(),
             b"sample.failed:The sample operation failed",
         );
+    }
+
+    #[test]
+    fn lets_a_custom_format_hide_internal_error_messages() {
+        let application = Router::new(
+            Config::new().error_format(|error: &Error| {
+                let message = if error.is_internal() {
+                    "Internal Server Error"
+                } else {
+                    error.message()
+                };
+
+                Response::text(error.status(), message)
+            }),
+            "/failure".GET(internal_failure),
+        );
+        let response = block_on(application.handle(request("GET", "/failure")));
+
+        assert_eq!(response.status(), 500);
+        assert_eq!(response.body(), b"Internal Server Error");
     }
 
     #[test]
@@ -617,14 +664,14 @@ mod tests {
     #[test]
     fn the_parent_router_controls_nested_error_formatting() {
         let child = Router::new(
-            Config::new().error_format(|error: &HttpError| {
+            Config::new().error_format(|error: &Error| {
                 Response::text(200, format!("child:{}", error.code()))
             }),
             "/failure".GET(failure),
         )
         .at("/child");
         let application = Router::new(
-            Config::new().error_format(|error: &HttpError| {
+            Config::new().error_format(|error: &Error| {
                 Response::text(200, format!("parent:{}", error.code()))
             }),
             child,

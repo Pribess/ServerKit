@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{HttpError, IntoResponse, RequestStream, Response};
+use crate::{Error, IntoResponse, RequestStream, Response};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Method(MethodRepr);
@@ -322,7 +322,7 @@ impl fmt::Display for InvalidHeader {
 
 impl IntoResponse for InvalidHeader {
     fn into_response(self) -> Response {
-        HttpError::new(500, "response.header.invalid", self.message).into_response()
+        Error::new(500, "response.header.invalid", self.message).into_response()
     }
 }
 

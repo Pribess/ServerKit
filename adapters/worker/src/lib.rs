@@ -15,7 +15,7 @@ use futures_core::Stream;
 use worker::{Cf, Context, Env};
 
 use serverkit::{
-    FromRequest, Headers, HttpError, IntoResponse, Method, Request, RequestStream, Response,
+    Error, FromRequest, Headers, IntoResponse, Method, Request, RequestStream, Response,
     ResponseBody, ResponseStream, StreamError,
 };
 
@@ -41,7 +41,7 @@ pub struct WorkerContextError;
 
 impl IntoResponse for WorkerContextError {
     fn into_response(self) -> Response {
-        HttpError::new(
+        Error::new(
             500,
             "application.worker_context.unavailable",
             "Cloudflare worker context is unavailable",

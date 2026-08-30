@@ -1,25 +1,67 @@
-use std::{fmt, fmt::Write};
+use std::{error::Error as StdError, fmt, fmt::Write};
 
-use crate::{Headers, IntoResponse, Response, ValidationErrors};
+use crate::{IntoResponse, Response, ValidationErrors};
 
 #[derive(Debug)]
-pub struct HttpError {
+pub struct Error {
     status: u16,
     code: String,
     message: String,
-    validation: Option<ValidationErrors>,
-    headers: Headers,
+    source: Option<Box<dyn StdError + Send + Sync>>,
 }
 
-impl HttpError {
+impl Error {
     pub fn new(status: u16, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             status,
             code: code.into(),
             message: message.into(),
-            validation: None,
-            headers: Headers::new(),
+            source: None,
         }
+    }
+
+    pub fn bad_request() -> Self {
+        Self::new(400, "bad_request", "Bad Request")
+    }
+
+    pub fn unauthorized() -> Self {
+        Self::new(401, "unauthorized", "Unauthorized")
+    }
+
+    pub fn forbidden() -> Self {
+        Self::new(403, "forbidden", "Forbidden")
+    }
+
+    pub fn not_found() -> Self {
+        Self::new(404, "not_found", "Not Found")
+    }
+
+    pub fn conflict() -> Self {
+        Self::new(409, "conflict", "Conflict")
+    }
+
+    pub fn unprocessable_content() -> Self {
+        Self::new(422, "unprocessable_content", "Unprocessable Content")
+    }
+
+    pub fn too_many_requests() -> Self {
+        Self::new(429, "too_many_requests", "Too Many Requests")
+    }
+
+    pub fn internal<E: StdError + Send + Sync + 'static>(source: E) -> Self {
+        let message = source.to_string();
+
+        Self {
+            status: 500,
+            code: "internal_error".to_owned(),
+            message,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
     }
 
     pub fn status(&self) -> u16 {
@@ -34,44 +76,69 @@ impl HttpError {
         &self.message
     }
 
-    pub fn validation(mut self, errors: ValidationErrors) -> Self {
-        self.validation = Some(errors);
-        self
+    pub fn is_internal(&self) -> bool {
+        self.source.is_some()
     }
 
-    pub fn validation_errors(&self) -> Option<&ValidationErrors> {
-        self.validation.as_ref()
-    }
-
-    pub fn headers(&mut self) -> &mut Headers {
-        &mut self.headers
-    }
-
-    pub(crate) fn take_headers(&mut self) -> Headers {
-        std::mem::take(&mut self.headers)
+    pub fn source(&self) -> Option<&(dyn StdError + Send + Sync + 'static)> {
+        self.source.as_deref()
     }
 }
 
-impl fmt::Display for HttpError {
+impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
     }
 }
 
-impl std::error::Error for HttpError {}
+impl<E: StdError + Send + Sync + 'static> From<E> for Error {
+    fn from(error: E) -> Self {
+        Self::internal(error)
+    }
+}
 
-impl IntoResponse for HttpError {
+impl IntoResponse for Error {
     fn into_response(self) -> Response {
         Response::pending_error(self)
     }
 }
 
-pub trait ErrorFormat: Send + Sync + 'static {
-    fn format(&self, error: &HttpError) -> Response;
+pub(crate) struct PendingError {
+    error: Error,
+    validation: Option<ValidationErrors>,
 }
 
-impl<F: Fn(&HttpError) -> Response + Send + Sync + 'static> ErrorFormat for F {
-    fn format(&self, error: &HttpError) -> Response {
+impl PendingError {
+    pub(crate) fn new(error: Error) -> Self {
+        Self {
+            error,
+            validation: None,
+        }
+    }
+
+    pub(crate) fn validation(error: Error, validation: ValidationErrors) -> Self {
+        Self {
+            error,
+            validation: Some(validation),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Error, Option<ValidationErrors>) {
+        (self.error, self.validation)
+    }
+}
+
+pub trait ErrorFormat: Send + Sync + 'static {
+    fn format(&self, error: &Error) -> Response;
+
+    #[doc(hidden)]
+    fn format_validation(&self, error: &Error, _validation: &ValidationErrors) -> Response {
+        self.format(error)
+    }
+}
+
+impl<F: Fn(&Error) -> Response + Send + Sync + 'static> ErrorFormat for F {
+    fn format(&self, error: &Error) -> Response {
         self(error)
     }
 }
@@ -79,21 +146,29 @@ impl<F: Fn(&HttpError) -> Response + Send + Sync + 'static> ErrorFormat for F {
 pub(crate) struct JsonErrorFormat;
 
 impl ErrorFormat for JsonErrorFormat {
-    fn format(&self, error: &HttpError) -> Response {
-        let mut response = Response::bytes(error.status(), encode_error_json(error));
-        response.set_header("Content-Type", "application/json");
-        response
+    fn format(&self, error: &Error) -> Response {
+        json_response(error, None)
+    }
+
+    fn format_validation(&self, error: &Error, validation: &ValidationErrors) -> Response {
+        json_response(error, Some(validation))
     }
 }
 
-fn encode_error_json(error: &HttpError) -> Vec<u8> {
+fn json_response(error: &Error, validation: Option<&ValidationErrors>) -> Response {
+    let mut response = Response::bytes(error.status(), encode_error_json(error, validation));
+    response.set_header("Content-Type", "application/json");
+    response
+}
+
+fn encode_error_json(error: &Error, validation: Option<&ValidationErrors>) -> Vec<u8> {
     let mut output = String::from("{\"error\":{\"code\":");
     write_json_string(&mut output, error.code());
     output.push_str(",\"message\":");
     write_json_string(&mut output, error.message());
     output.push_str(",\"fields\":[");
 
-    if let Some(errors) = error.validation_errors() {
+    if let Some(errors) = validation {
         for (index, issue) in errors.issues().iter().enumerate() {
             if index != 0 {
                 output.push(',');
@@ -143,18 +218,39 @@ fn write_json_string(output: &mut String, value: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::{error::Error as StdError, fmt};
+
     use super::JsonErrorFormat;
-    use crate::{ErrorFormat, HttpError, ValidationErrors, ValidationIssue};
+    use crate::{Error, ErrorFormat, ValidationErrors, ValidationIssue};
+
+    #[derive(Debug)]
+    struct DatabaseError;
+
+    impl fmt::Display for DatabaseError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("database connection lost")
+        }
+    }
+
+    impl StdError for DatabaseError {}
+
+    fn database_operation() -> Result<(), DatabaseError> {
+        Err(DatabaseError)
+    }
+
+    fn propagate_database_error() -> Result<(), Error> {
+        database_operation()?;
+        Ok(())
+    }
 
     #[test]
     fn renders_the_default_json_envelope_and_escapes_strings() {
-        let error = HttpError::new(400, "request.invalid", "bad \"value\"\n").validation(
-            ValidationErrors::from_issue(ValidationIssue::coded(
-                "field.invalid",
-                "must not contain \\ escapes",
-            )),
-        );
-        let response = JsonErrorFormat.format(&error);
+        let error = Error::new(400, "request.invalid", "bad \"value\"\n");
+        let validation = ValidationErrors::from_issue(ValidationIssue::coded(
+            "field.invalid",
+            "must not contain \\ escapes",
+        ));
+        let response = JsonErrorFormat.format_validation(&error, &validation);
 
         assert_eq!(response.status(), 400);
         assert_eq!(response.content_type(), Some("application/json"));
@@ -162,5 +258,54 @@ mod tests {
             response.body(),
             br#"{"error":{"code":"request.invalid","message":"bad \"value\"\n","fields":[{"field":null,"code":"field.invalid","message":"must not contain \\ escapes"}]}}"#,
         );
+    }
+
+    #[test]
+    fn converts_standard_errors_into_visible_internal_errors() {
+        let error = propagate_database_error().unwrap_err();
+        let response = JsonErrorFormat.format(&error);
+
+        assert_eq!(error.status(), 500);
+        assert_eq!(error.code(), "internal_error");
+        assert_eq!(error.message(), "database connection lost");
+        assert!(error.is_internal());
+        assert_eq!(
+            error.source().unwrap().to_string(),
+            "database connection lost"
+        );
+        assert_eq!(
+            response.body(),
+            br#"{"error":{"code":"internal_error","message":"database connection lost","fields":[]}}"#,
+        );
+    }
+
+    #[test]
+    fn provides_predefined_errors_without_requiring_codes() {
+        let cases = [
+            (Error::bad_request(), 400, "bad_request", "Bad Request"),
+            (Error::unauthorized(), 401, "unauthorized", "Unauthorized"),
+            (Error::forbidden(), 403, "forbidden", "Forbidden"),
+            (Error::not_found(), 404, "not_found", "Not Found"),
+            (Error::conflict(), 409, "conflict", "Conflict"),
+            (
+                Error::unprocessable_content(),
+                422,
+                "unprocessable_content",
+                "Unprocessable Content",
+            ),
+            (
+                Error::too_many_requests(),
+                429,
+                "too_many_requests",
+                "Too Many Requests",
+            ),
+        ];
+
+        for (error, status, code, message) in cases {
+            assert_eq!(error.status(), status);
+            assert_eq!(error.code(), code);
+            assert_eq!(error.message(), message);
+            assert!(!error.is_internal());
+        }
     }
 }

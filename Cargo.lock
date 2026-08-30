@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "serverkit"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "serverkit-hyper"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-io",
  "futures-util",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "serverkit-worker"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "futures-core",
  "serverkit",

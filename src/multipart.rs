@@ -1,5 +1,5 @@
 use crate::{
-    Body, FromRequest, Headers, HttpError, IntoResponse, Request, Response, StreamError,
+    Body, Error, FromRequest, Headers, IntoResponse, Request, Response, StreamError,
     extract::content_type, openapi::Operation,
 };
 
@@ -199,24 +199,24 @@ pub enum MultipartError {
 impl IntoResponse for MultipartError {
     fn into_response(self) -> Response {
         match self {
-            Self::ContentType => HttpError::new(
+            Self::ContentType => Error::new(
                 415,
                 "request.content_type.unsupported",
                 "expected multipart/form-data request body",
             ),
-            Self::Boundary => HttpError::new(
+            Self::Boundary => Error::new(
                 400,
                 "request.multipart.invalid_boundary",
                 "multipart boundary is missing or invalid",
             ),
-            Self::Malformed => HttpError::new(
+            Self::Malformed => Error::new(
                 400,
                 "request.multipart.invalid",
                 "multipart request body is malformed",
             ),
             Self::Stream(error) => return error.into_response(),
             Self::Text(error) => {
-                HttpError::new(400, "request.multipart.invalid_text", error.to_string())
+                Error::new(400, "request.multipart.invalid_text", error.to_string())
             }
         }
         .into_response()

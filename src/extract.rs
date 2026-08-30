@@ -4,7 +4,7 @@ use std::{convert::Infallible, marker::PhantomData, sync::Arc};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
-    Body, Cookies, DecodeOptions, HttpError, IntoResponse, Method, Request, Response, Schema,
+    Body, Cookies, DecodeOptions, Error, IntoResponse, Method, Request, Response, Schema,
     UnknownFields, ValidationErrors, ValidationIssue, ValidationRule, Value, Values,
     openapi::{Operation, ParameterLocation},
     schemaval::{SchemaKind, SchemaMetadata},
@@ -66,7 +66,7 @@ macro_rules! missing_value {
     ($type:ident, $code:literal, $message:literal) => {
         impl<T> IntoResponse for $type<T> {
             fn into_response(self) -> Response {
-                HttpError::new(500, $code, $message).into_response()
+                Error::new(500, $code, $message).into_response()
             }
         }
     };
@@ -160,7 +160,7 @@ pub struct TextError;
 
 impl IntoResponse for TextError {
     fn into_response(self) -> Response {
-        HttpError::new(
+        Error::new(
             400,
             "request.text.invalid",
             "request body must be valid UTF-8",
@@ -202,20 +202,21 @@ pub enum FormError {
 impl IntoResponse for FormError {
     fn into_response(self) -> Response {
         match self {
-            Self::ContentType => HttpError::new(
+            Self::ContentType => Error::new(
                 415,
                 "request.content_type.unsupported",
                 "expected application/x-www-form-urlencoded request body",
-            ),
+            )
+            .into_response(),
             Self::Encoding => {
-                HttpError::new(400, "request.form.invalid", "form body must be valid UTF-8")
+                Error::new(400, "request.form.invalid", "form body must be valid UTF-8")
+                    .into_response()
             }
-            Self::Validation(errors) => {
-                HttpError::new(400, "request.form.invalid", "Invalid form request body")
-                    .validation(errors)
-            }
+            Self::Validation(errors) => Response::pending_validation(
+                Error::new(400, "request.form.invalid", "Invalid form request body"),
+                errors,
+            ),
         }
-        .into_response()
     }
 }
 
@@ -273,9 +274,7 @@ macro_rules! extractor_error {
     ($type:ty, $code:literal, $message:literal) => {
         impl IntoResponse for $type {
             fn into_response(self) -> Response {
-                HttpError::new(400, $code, $message)
-                    .validation(self.0)
-                    .into_response()
+                Response::pending_validation(Error::new(400, $code, $message), self.0)
             }
         }
     };
@@ -530,14 +529,12 @@ pub enum JsonError {
 impl IntoResponse for JsonError {
     fn into_response(self) -> Response {
         match self {
-            Self::ContentType => HttpError::new(
+            Self::ContentType => Error::new(
                 415,
                 "request.content_type.unsupported",
                 "expected application/json request body",
             ),
-            Self::Deserialize(error) => {
-                HttpError::new(400, "request.json.invalid", error.to_string())
-            }
+            Self::Deserialize(error) => Error::new(400, "request.json.invalid", error.to_string()),
         }
         .into_response()
     }
@@ -585,10 +582,8 @@ impl<T: Serialize + Schema> IntoResponse for Json<T> {
                 response.set_header("Content-Type", "application/json");
                 response
             }
-            Err(error) => {
-                HttpError::new(500, "response.json.serialization_failed", error.to_string())
-                    .into_response()
-            }
+            Err(error) => Error::new(500, "response.json.serialization_failed", error.to_string())
+                .into_response(),
         }
     }
 

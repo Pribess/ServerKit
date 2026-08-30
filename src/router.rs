@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    Handler, HttpError, IntoResponse, Method, Request, Response,
+    Error, Handler, IntoResponse, Method, Request, Response,
     middleware::{MiddlewareEntry, MiddlewareFuture, MiddlewareTerminal},
     openapi::{Operation, RouteDescription},
 };
@@ -606,17 +606,13 @@ impl MiddlewareTerminal for Dispatch<'_> {
                     response
                 }
                 Self::Fallback(fallback) => fallback.handler.call(request).await,
-                Self::NotFound => {
-                    HttpError::new(404, "route.not_found", "Not Found").into_response()
-                }
+                Self::NotFound => Error::new(404, "route.not_found", "Not Found").into_response(),
                 Self::MethodNotAllowed { allow } => {
-                    let mut error =
-                        HttpError::new(405, "route.method_not_allowed", "Method Not Allowed");
-                    error
-                        .headers()
-                        .set("Allow", allow.clone())
-                        .expect("a generated Allow header is valid");
-                    error.into_response()
+                    let mut response =
+                        Error::new(405, "route.method_not_allowed", "Method Not Allowed")
+                            .into_response();
+                    response.set_header("Allow", allow.clone());
+                    response
                 }
                 Self::Options { allow } => {
                     let mut response = Response::empty();

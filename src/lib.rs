@@ -30,7 +30,7 @@ pub use body::Body;
 
 pub use cookie::{Cookie, Cookies, SameSite};
 
-pub use error::{ErrorFormat, HttpError};
+pub use error::{Error, ErrorFormat};
 
 pub use extract::{
     Bytes, ConnectInfo, Extension, Form, FormError, FromRequest, Header, HeaderError,
@@ -89,8 +89,8 @@ pub mod adapter {
 
 pub mod prelude {
     pub use crate::{
-        ApiKeyLocation, Body, Chunk, Config, DecodeOptions, ErrorFormat, ExampleValue, ExtraFields,
-        FromRequest, Handler, Header, HeaderError, Headers, HttpError, IntoResponse, Method,
+        ApiKeyLocation, Body, Chunk, Config, DecodeOptions, Error, ErrorFormat, ExampleValue,
+        ExtraFields, FromRequest, Handler, Header, HeaderError, Headers, IntoResponse, Method,
         Middleware, Next, OAuthFlow, OAuthFlows, OpenApi, OpenApiDocument, Operation,
         ParameterLocation, Path, PathError, Query, QueryError, Request, RequestStream, Response,
         ResponseBody, ResponseStream, Route, RouteMethods, Router, Scalar, ScalarDeveloperTools,

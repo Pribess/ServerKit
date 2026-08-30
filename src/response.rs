@@ -1,7 +1,8 @@
 use std::convert::Infallible;
 
 use crate::{
-    Cookie, Headers, HttpError, InvalidHeader, ResponseStream,
+    Cookie, Error, Headers, InvalidHeader, ResponseStream, ValidationErrors,
+    error::PendingError,
     openapi::Operation,
     schemaval::{SchemaKind, SchemaMetadata},
 };
@@ -35,7 +36,7 @@ pub struct Response {
     status: u16,
     headers: Headers,
     body: ResponseBody,
-    error: Option<HttpError>,
+    error: Option<PendingError>,
 }
 
 impl Response {
@@ -106,14 +107,21 @@ impl Response {
         response
     }
 
-    pub(crate) fn pending_error(mut error: HttpError) -> Self {
-        let headers = error.take_headers();
-
+    pub(crate) fn pending_error(error: Error) -> Self {
         Self {
             status: error.status(),
-            headers,
+            headers: Headers::new(),
             body: ResponseBody::Buffered(Vec::new()),
-            error: Some(error),
+            error: Some(PendingError::new(error)),
+        }
+    }
+
+    pub(crate) fn pending_validation(error: Error, validation: ValidationErrors) -> Self {
+        Self {
+            status: error.status(),
+            headers: Headers::new(),
+            body: ResponseBody::Buffered(Vec::new()),
+            error: Some(PendingError::validation(error, validation)),
         }
     }
 
@@ -163,7 +171,7 @@ impl Response {
         self
     }
 
-    pub(crate) fn take_error(&mut self) -> Option<HttpError> {
+    pub(crate) fn take_error(&mut self) -> Option<PendingError> {
         self.error.take()
     }
 

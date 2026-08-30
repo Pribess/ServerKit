@@ -1,6 +1,6 @@
 [package]
 name = "serverkit-worker"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Cloudflare Workers adapter for ServerKit"
 license.workspace = true
@@ -11,7 +11,7 @@ default = []
 websocket = ["serverkit/websocket"]
 
 [dependencies]
-serverkit = { version = "0.3.0", path = "../.." }
+serverkit = { version = "0.4.0", path = "../.." }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 futures-core = "0.3"

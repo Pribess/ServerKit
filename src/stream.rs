@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{HttpError, IntoResponse, Response};
+use crate::{Error, IntoResponse, Response};
 
 pub trait RequestStream {
     /// Advances to the next chunk without transferring its allocation.
@@ -137,7 +137,7 @@ impl std::error::Error for StreamError {}
 
 impl IntoResponse for StreamError {
     fn into_response(self) -> Response {
-        HttpError::new(self.status, self.code, self.message).into_response()
+        Error::new(self.status, self.code, self.message).into_response()
     }
 }
 

@@ -507,7 +507,7 @@ and apply `#[schema(unknown_fields = "...")]` when it is present.
 Failures are aggregated in `ValidationErrors`. Each `ValidationIssue` exposes
 its optional field name, stable code, `ValidationRule`, and message. Use
 `ValidationIssue::coded` when a custom validator needs an application-specific
-code. Extractors preserve validation failures in the router's `HttpError`.
+code. Extractors preserve validation failures in the router's `Error`.
 
 ```rust
 use serverkit::ValidationIssue;
@@ -564,7 +564,7 @@ assert_eq!(identifier.id, 42);
 
 ## Error responses
 
-Every request-time error is represented as an `HttpError` until middleware has
+Every request-time error is represented as an `Error` until middleware has
 finished. `Router::handle` then renders it once. The default renderer is a
 dependency-free JSON envelope, including when the `json` feature is disabled:
 
@@ -582,21 +582,53 @@ Path, query, header, and form validation errors populate `fields` from the
 original Schemaval issues. Each field contains `field`, `code`, and `message`;
 `field` is `null` for a request-wide issue.
 
-Application handlers return their own stable status, code, and public message:
+Application handlers can use predefined errors without repeating status codes,
+error codes, or messages:
 
 ```rust
-use serverkit::HttpError;
+use serverkit::Error;
 
 # async fn find_user() -> Option<String> { None }
-async fn user() -> Result<String, HttpError> {
+async fn user() -> Result<String, Error> {
     find_user()
         .await
-        .ok_or_else(|| HttpError::new(
-            404,
-            "user.not_found",
-            "User does not exist",
-        ))
+        .ok_or_else(Error::not_found)
 }
+```
+
+`bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`,
+`unprocessable_content`, and `too_many_requests` provide the common HTTP
+failures. `with_message` changes only the public message. Use `Error::new` when
+an application-specific code is required.
+
+Any `std::error::Error + Send + Sync + 'static` converts into an internal error
+through `?`. ServerKit uses the standard `Result<T, Error>` rather than defining
+another result alias:
+
+```rust
+use serverkit::Error;
+
+async fn read_configuration() -> Result<Vec<u8>, Error> {
+    Ok(std::fs::read("configuration.json")?)
+}
+```
+
+The default JSON format exposes the original internal error message under the
+stable `internal_error` code. Production applications can hide it with the
+existing formatter hook while retaining the source for logging:
+
+```rust
+use serverkit::{Config, Error, Response};
+
+let config = Config::new().error_format(|error: &Error| {
+    let message = if error.is_internal() {
+        "Internal Server Error"
+    } else {
+        error.message()
+    };
+
+    Response::text(error.status(), message)
+});
 ```
 
 Configure a different representation once for the whole router. The formatter
@@ -604,9 +636,9 @@ chooses the body and representation headers; ServerKit preserves the original
 status and protocol headers such as `Allow` and `WWW-Authenticate`.
 
 ```rust
-use serverkit::{Config, HttpError, Response};
+use serverkit::{Config, Error, Response};
 
-let config = Config::new().error_format(|error: &HttpError| {
+let config = Config::new().error_format(|error: &Error| {
     Response::text(
         error.status(),
         format!("{}: {}", error.code(), error.message()),
@@ -978,12 +1010,12 @@ Set `BUFFERED` only when the extractor needs the complete body; otherwise the
 slice is empty and the runtime stream remains untouched.
 
 ```rust
-use serverkit::{FromRequest, HttpError, Request};
+use serverkit::{FromRequest, Error, Request};
 
 struct UserAgent(String);
 
 impl<'request> FromRequest<(&'request Request, &'request [u8])> for UserAgent {
-    type Error = HttpError;
+    type Error = Error;
 
     async fn from_request(
         input: (&'request Request, &'request [u8]),
@@ -992,17 +1024,9 @@ impl<'request> FromRequest<(&'request Request, &'request [u8])> for UserAgent {
             .0
             .headers
             .get("user-agent")
-            .ok_or_else(|| HttpError::new(
-                400,
-                "request.user_agent.missing",
-                "missing user-agent",
-            ))?;
+            .ok_or_else(|| Error::bad_request().with_message("missing user-agent"))?;
         let value = std::str::from_utf8(value)
-            .map_err(|_| HttpError::new(
-                400,
-                "request.user_agent.invalid",
-                "invalid user-agent",
-            ))?;
+            .map_err(|_| Error::bad_request().with_message("invalid user-agent"))?;
 
         Ok(Self(value.to_owned()))
     }

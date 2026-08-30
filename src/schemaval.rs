@@ -433,13 +433,14 @@ impl fmt::Display for ValidationErrors {
 
 impl IntoResponse for ValidationErrors {
     fn into_response(self) -> Response {
-        crate::HttpError::new(
-            400,
-            "request.validation.invalid",
-            "Request validation failed",
+        Response::pending_validation(
+            crate::Error::new(
+                400,
+                "request.validation.invalid",
+                "Request validation failed",
+            ),
+            self,
         )
-        .validation(self)
-        .into_response()
     }
 }
 
