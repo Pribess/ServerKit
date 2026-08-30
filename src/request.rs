@@ -366,13 +366,70 @@ fn validate_header(name: &str, value: &[u8]) -> Result<(), InvalidHeader> {
     Ok(())
 }
 
+#[derive(Default)]
+pub struct Extensions {
+    values: HashMap<TypeId, Box<dyn Any>>,
+}
+
+impl Extensions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert<T: 'static>(&mut self, value: T) -> Option<T> {
+        self.values
+            .insert(TypeId::of::<T>(), Box::new(value))
+            .map(|previous| {
+                *previous
+                    .downcast::<T>()
+                    .expect("an extension must match its type identifier")
+            })
+    }
+
+    pub fn get<T: 'static>(&self) -> Option<&T> {
+        self.values
+            .get(&TypeId::of::<T>())
+            .and_then(|value| value.downcast_ref())
+    }
+
+    pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        self.values
+            .get_mut(&TypeId::of::<T>())
+            .and_then(|value| value.downcast_mut())
+    }
+
+    pub fn remove<T: 'static>(&mut self) -> Option<T> {
+        self.values.remove(&TypeId::of::<T>()).map(|value| {
+            *value
+                .downcast::<T>()
+                .expect("an extension must match its type identifier")
+        })
+    }
+
+    pub fn contains<T: 'static>(&self) -> bool {
+        self.values.contains_key(&TypeId::of::<T>())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.values.clear();
+    }
+}
+
 pub struct Request {
     pub method: Method,
     pub path: String,
     pub query: Option<String>,
     pub headers: Headers,
+    pub extensions: Extensions,
     params: Vec<(String, String)>,
-    extensions: HashMap<TypeId, Box<dyn Any>>,
     states: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
     body_limit: Option<usize>,
     pub(crate) body: Box<dyn RequestStream>,
@@ -391,8 +448,8 @@ impl Request {
             path: path.into(),
             query,
             headers,
+            extensions: Extensions::new(),
             params: Vec::new(),
-            extensions: HashMap::new(),
             states: HashMap::new(),
             body_limit: None,
             body,
@@ -405,16 +462,6 @@ impl Request {
 
     pub(crate) fn set_params(&mut self, params: Vec<(String, String)>) {
         self.params = params;
-    }
-
-    pub fn insert_extension<T: 'static>(&mut self, value: T) {
-        self.extensions.insert(TypeId::of::<T>(), Box::new(value));
-    }
-
-    pub fn extension<T: 'static>(&self) -> Option<&T> {
-        self.extensions
-            .get(&TypeId::of::<T>())
-            .and_then(|value| value.downcast_ref())
     }
 
     pub(crate) fn set_states(&mut self, states: HashMap<TypeId, Arc<dyn Any + Send + Sync>>) {
@@ -434,6 +481,31 @@ impl Request {
 
     pub(crate) fn body_limit(&self) -> Option<usize> {
         self.body_limit
+    }
+}
+
+#[cfg(test)]
+mod extensions_tests {
+    use super::Extensions;
+
+    #[test]
+    fn stores_replaces_mutates_and_removes_values_by_type() {
+        let mut extensions = Extensions::new();
+
+        assert!(extensions.is_empty());
+        assert_eq!(extensions.insert(1_u64), None);
+        assert_eq!(extensions.insert(String::from("first")), None);
+        assert_eq!(extensions.len(), 2);
+        assert!(extensions.contains::<u64>());
+        assert_eq!(extensions.get::<u64>(), Some(&1));
+
+        assert_eq!(extensions.insert(2_u64), Some(1));
+        *extensions.get_mut::<u64>().unwrap() = 3;
+        assert_eq!(extensions.remove::<u64>(), Some(3));
+        assert!(!extensions.contains::<u64>());
+
+        extensions.clear();
+        assert!(extensions.is_empty());
     }
 }
 

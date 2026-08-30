@@ -52,7 +52,7 @@ pub use openapi::{
     ParameterLocation, Scalar, ScalarDeveloperTools, SecurityRequirement, SecurityScheme, Server,
 };
 
-pub use request::{Headers, InvalidHeader, InvalidMethod, Method, Request};
+pub use request::{Extensions, Headers, InvalidHeader, InvalidMethod, Method, Request};
 
 pub use redirect::Redirect;
 
@@ -90,8 +90,8 @@ pub mod adapter {
 pub mod prelude {
     pub use crate::{
         ApiKeyLocation, Body, Chunk, Config, DecodeOptions, Error, ErrorFormat, ExampleValue,
-        ExtraFields, FromRequest, Handler, Header, HeaderError, Headers, IntoResponse, Method,
-        Middleware, Next, OAuthFlow, OAuthFlows, OpenApi, OpenApiDocument, Operation,
+        Extensions, ExtraFields, FromRequest, Handler, Header, HeaderError, Headers, IntoResponse,
+        Method, Middleware, Next, OAuthFlow, OAuthFlows, OpenApi, OpenApiDocument, Operation,
         ParameterLocation, Path, PathError, Query, QueryError, Request, RequestStream, Response,
         ResponseBody, ResponseStream, Route, RouteMethods, Router, Scalar, ScalarDeveloperTools,
         Schema, SchemaField, SchemaKind, SchemaMetadata, SecurityRequirement, SecurityScheme,

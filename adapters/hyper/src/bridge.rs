@@ -38,7 +38,7 @@ pub(crate) async fn handle_request(
         headers,
         Box::new(HyperRequestStream::new(body)),
     );
-    request.insert_extension(address);
+    request.extensions.insert(address);
 
     HandledRequest {
         response: router.handle(request).await,

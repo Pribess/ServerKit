@@ -85,7 +85,8 @@ impl<'request> FromRequest<(&'request Request, &'request [u8])> for WorkerContex
     async fn from_request(input: (&'request Request, &'request [u8])) -> Result<Self, Self::Error> {
         input
             .0
-            .extension::<Self>()
+            .extensions
+            .get::<Self>()
             .cloned()
             .ok_or(WorkerContextError)
     }
@@ -172,7 +173,9 @@ pub fn from_request(
     };
 
     let mut request = Request::from_parts(method, path, query, headers, body);
-    request.insert_extension(WorkerContext::new(env, context, cf));
+    request
+        .extensions
+        .insert(WorkerContext::new(env, context, cf));
 
     Ok(request)
 }

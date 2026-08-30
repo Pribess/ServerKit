@@ -411,7 +411,7 @@ mod tests {
 
         let application = Router::new(Config::new(), ("/".GET(request_extension),));
         let mut request = request(b"", Rc::new(Cell::new(0)));
-        request.insert_extension(42_u64);
+        request.extensions.insert(42_u64);
         let response = block_on(application.handle(request));
         assert_eq!(response.body(), b"42");
     }

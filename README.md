@@ -985,6 +985,15 @@ Runtime-specific values can be inserted into a `Request` and cloned with
 through `ConnectInfo<SocketAddr>`.
 
 ```rust
+use serverkit::Request;
+
+fn attach_value(request: &mut Request) {
+    request.extensions.insert(42_u64);
+    assert_eq!(request.extensions.get::<u64>(), Some(&42));
+}
+```
+
+```rust
 use std::net::SocketAddr;
 use serverkit::ConnectInfo;
 

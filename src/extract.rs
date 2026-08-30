@@ -116,7 +116,8 @@ impl<'request, T: Clone + 'static> FromRequest<(&'request Request, &'request [u8
     async fn from_request(input: (&'request Request, &'request [u8])) -> Result<Self, Self::Error> {
         input
             .0
-            .extension::<T>()
+            .extensions
+            .get::<T>()
             .cloned()
             .map(Self)
             .ok_or(MissingExtension(PhantomData))
@@ -131,7 +132,8 @@ impl<'request, T: Clone + 'static> FromRequest<(&'request Request, &'request [u8
     async fn from_request(input: (&'request Request, &'request [u8])) -> Result<Self, Self::Error> {
         input
             .0
-            .extension::<T>()
+            .extensions
+            .get::<T>()
             .cloned()
             .map(Self)
             .ok_or(MissingConnectInfo(PhantomData))
