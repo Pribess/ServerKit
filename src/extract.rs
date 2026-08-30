@@ -64,9 +64,15 @@ pub struct MissingConnectInfo<T>(PhantomData<fn() -> T>);
 
 macro_rules! missing_value {
     ($type:ident, $code:literal, $message:literal) => {
+        impl<T> From<$type<T>> for Error {
+            fn from(_error: $type<T>) -> Self {
+                Self::new(500, $code, $message)
+            }
+        }
+
         impl<T> IntoResponse for $type<T> {
             fn into_response(self) -> Response {
-                Error::new(500, $code, $message).into_response()
+                Error::from(self).into_response()
             }
         }
     };

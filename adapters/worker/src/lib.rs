@@ -39,14 +39,19 @@ pub struct WorkerContext {
 #[derive(Debug)]
 pub struct WorkerContextError;
 
-impl IntoResponse for WorkerContextError {
-    fn into_response(self) -> Response {
-        Error::new(
+impl From<WorkerContextError> for Error {
+    fn from(_error: WorkerContextError) -> Self {
+        Self::new(
             500,
             "application.worker_context.unavailable",
             "Cloudflare worker context is unavailable",
         )
-        .into_response()
+    }
+}
+
+impl IntoResponse for WorkerContextError {
+    fn into_response(self) -> Response {
+        Error::from(self).into_response()
     }
 }
 

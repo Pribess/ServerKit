@@ -1037,6 +1037,33 @@ async fn handler(user_agent: UserAgent) -> String {
 }
 ```
 
+Composite extractors can reuse `State`, `Extension`, and `ConnectInfo` with
+`?`. Missing runtime values keep their original status, code, and message when
+they are converted into `Error`.
+
+```rust
+use serverkit::{Error, FromRequest, Request, State};
+
+struct Configuration {
+    region: String,
+}
+
+struct Region(String);
+
+impl<'request> FromRequest<(&'request Request, &'request [u8])> for Region {
+    type Error = Error;
+
+    async fn from_request(
+        input: (&'request Request, &'request [u8]),
+    ) -> Result<Self, Self::Error> {
+        let State(configuration) =
+            State::<Configuration>::from_request(input).await?;
+
+        Ok(Self(configuration.region.clone()))
+    }
+}
+```
+
 A buffered extractor uses the same signature:
 
 ```rust

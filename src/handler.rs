@@ -190,7 +190,7 @@ mod tests {
     };
 
     use crate::{
-        Body, Bytes, Config, Extension, FromRequest, Handler, Headers, Method, Request,
+        Body, Bytes, Config, Error, Extension, FromRequest, Handler, Headers, Method, Request,
         RequestStream, RouteMethods, Router, State, StreamError,
     };
 
@@ -221,6 +221,19 @@ mod tests {
     }
 
     struct BufferedBytes(Vec<u8>);
+
+    struct StateBacked(String);
+
+    impl<'request> FromRequest<(&'request Request, &'request [u8])> for StateBacked {
+        type Error = Error;
+
+        async fn from_request(
+            input: (&'request Request, &'request [u8]),
+        ) -> Result<Self, Self::Error> {
+            let State(value) = State::<String>::from_request(input).await?;
+            Ok(Self(value.as_str().to_owned()))
+        }
+    }
 
     impl<'request> FromRequest<(&'request Request, &'request [u8])> for BufferedBytes {
         type Error = Infallible;
@@ -300,6 +313,10 @@ mod tests {
 
     async fn request_extension(Extension(value): Extension<u64>) -> String {
         value.to_string()
+    }
+
+    async fn state_backed(StateBacked(value): StateBacked) -> String {
+        value
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -397,5 +414,21 @@ mod tests {
         request.insert_extension(42_u64);
         let response = block_on(application.handle(request));
         assert_eq!(response.body(), b"42");
+    }
+
+    #[test]
+    fn nested_extractors_can_propagate_missing_values_into_error() {
+        let application =
+            Router::new(Config::new(), ("/".GET(state_backed),)).state("ready".to_owned());
+        let response = block_on(application.handle(request(b"", Rc::new(Cell::new(0)))));
+        assert_eq!(response.body(), b"ready");
+
+        let application = Router::new(Config::new(), ("/".GET(state_backed),));
+        let response = block_on(application.handle(request(b"", Rc::new(Cell::new(0)))));
+        assert_eq!(response.status(), 500);
+        assert_eq!(
+            response.body(),
+            br#"{"error":{"code":"application.state.unavailable","message":"application state is unavailable","fields":[]}}"#,
+        );
     }
 }
